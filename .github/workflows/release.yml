@@ -1,0 +1,94 @@
+name: Release Windows
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.x"
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install Wails CLI
+        shell: pwsh
+        run: go install github.com/wailsapp/wails/v2/cmd/wails@v2.12.0
+
+      - name: Ensure NSIS is installed
+        shell: pwsh
+        run: |
+          if (-not (Get-Command makensis.exe -ErrorAction SilentlyContinue)) {
+            $nsisPath = "${env:ProgramFiles(x86)}\NSIS"
+            if (Test-Path "$nsisPath\makensis.exe") {
+              "$nsisPath" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+            } else {
+              choco install nsis -y
+              "$nsisPath" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+            }
+          }
+
+      - name: Run Go tests
+        shell: pwsh
+        run: go test -count=1 ./...
+
+      - name: Build & Package Windows Release
+        shell: pwsh
+        run: |
+          $version = "${{ github.ref_name }}".TrimStart("v")
+          if (-not $version -or $version -eq "main") {
+            $version = (Get-Content wails.json | ConvertFrom-Json).info.productVersion
+          }
+          $releaseDir = "release"
+          $x64Name = "SanTianShell-$version-Windows-x64"
+          $iperfSource = "build\windows\tools\iperf3\x64"
+
+          wails build -clean -trimpath -platform windows/amd64 -webview2 embed -nsis
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          New-Item -ItemType Directory -Force -Path "$releaseDir\$x64Name\tools\iperf3\licenses" | Out-Null
+
+          if (Test-Path "build\bin\SanTianShell-amd64.exe") {
+            Copy-Item "build\bin\SanTianShell-amd64.exe" "$releaseDir\$x64Name\SanTianShell.exe" -Force
+          } else {
+            Copy-Item "build\bin\SanTianShell.exe" "$releaseDir\$x64Name\SanTianShell.exe" -Force
+          }
+
+          if (Test-Path "build\bin\SanTianShell-amd64-installer.exe") {
+            Copy-Item "build\bin\SanTianShell-amd64-installer.exe" "$releaseDir\$x64Name-Setup.exe" -Force
+          } else {
+            Copy-Item "build\bin\SanTianShell-installer.exe" "$releaseDir\$x64Name-Setup.exe" -Force
+          }
+
+          foreach ($f in @("iperf3.exe", "cygwin1.dll", "THIRD-PARTY-NOTICES.txt")) {
+            Copy-Item "$iperfSource\$f" "$releaseDir\$x64Name\tools\iperf3\$f" -Force
+          }
+          foreach ($f in @("iperf3-LICENSE.txt", "Cygwin-Licensing.html", "Cygwin-COPYING.LIB.txt")) {
+            Copy-Item "$iperfSource\licenses\$f" "$releaseDir\$x64Name\tools\iperf3\licenses\$f" -Force
+          }
+
+          tar.exe -a -c -f "$releaseDir\$x64Name.zip" -C "$releaseDir" "$x64Name"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Upload to GitHub Releases
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            release/SanTianShell-*-Windows-x64-Setup.exe
+            release/SanTianShell-*-Windows-x64.zip

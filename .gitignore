@@ -17,6 +17,7 @@ release/
 frontend/dist/
 frontend/node_modules/
 *.exe
+!build/windows/tools/**/*.exe
 *.zip
 *.msi
 *.old
