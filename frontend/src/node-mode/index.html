@@ -1,0 +1,812 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>SanTianShell 节点模式</title>
+  <script>
+    try {
+      document.documentElement.dataset.shellTheme = "dark";
+      document.documentElement.style.colorScheme = "dark";
+    } catch {}
+  </script>
+  <link rel="stylesheet" href="./style.css" />
+</head>
+<body>
+  <div class="layout">
+    <header class="app-nav">
+      <div class="brand">
+        <span class="brand-name">SanTianShell · 节点模式</span>
+        <span id="versionText" class="brand-version"></span>
+      </div>
+      <nav class="nav">
+        <button class="nav-item active" data-view="vps">VPS 列表</button>
+        <button class="nav-item" data-view="nodes">所有节点</button>
+        <button class="nav-item" data-view="proxy">代理检测</button>
+        <button class="nav-item" data-view="middle">中转加速</button>
+        <button class="nav-item" data-view="deleted">删除记录</button>
+      </nav>
+      <div class="data-path" id="dataPath"></div>
+    </header>
+
+    <main class="content">
+      <header class="page-header">
+        <div>
+          <h1 id="pageTitle">VPS 连接列表</h1>
+          <p id="pageDesc">管理服务器、Sing-box 状态和节点配置。</p>
+        </div>
+        <div class="top-actions">
+          <label id="vpsCountryFilterWrap" class="vps-country-filter">
+            <span>国家</span>
+            <select id="vpsCountryFilter" aria-label="按国家筛选 VPS">
+              <option value="">全部国家</option>
+            </select>
+          </label>
+          <button class="btn primary" id="addVpsBtn">添加 VPS</button>
+          <button class="btn primary" id="reloadBtn">刷新状态</button>
+        </div>
+      </header>
+
+      <section class="stats hidden">
+        <div class="stat"><span>VPS</span><strong id="vpsCount">0</strong></div>
+        <div class="stat"><span>节点</span><strong id="nodeCount">0</strong></div>
+        <div class="stat"><span>备份</span><strong id="backupCount">0</strong></div>
+      </section>
+
+      <section class="view-panel" id="vpsView">
+        <div class="table-card">
+          <table class="vps-table">
+            <thead>
+              <tr>
+                <th>别名</th>
+                <th>国家</th>
+                <th>地址</th>
+                <th>端口</th>
+                <th>起始端口</th>
+                <th>用户名</th>
+                <th>入站域名</th>
+                <th>中转域名</th>
+                <th>Sing-box</th>
+                <th>节点状态</th>
+                <th>操作</th>
+              </tr>
+            </thead>
+            <tbody id="vpsRows"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="view-panel hidden" id="nodesView">
+        <div class="filter-card">
+          <div class="filter-field"><label for="nodeAliasText">VPS 别名</label><div class="filter-combo" data-filter-combo="alias"><input id="nodeAliasText" placeholder="选择或输入别名" autocomplete="off" /><button class="filter-combo-clear" type="button" aria-label="清除 VPS 别名"></button><button class="filter-combo-toggle" type="button" aria-label="展开 VPS 别名"></button><div class="filter-combo-menu hidden"></div></div></div>
+          <div class="filter-field"><label for="nodeVpsIpSearch">VPS IP</label><div class="filter-combo" data-filter-combo="ip"><input id="nodeVpsIpSearch" placeholder="选择或输入 IP" autocomplete="off" /><button class="filter-combo-clear" type="button" aria-label="清除 VPS IP"></button><button class="filter-combo-toggle" type="button" aria-label="展开 VPS IP"></button><div class="filter-combo-menu hidden"></div></div></div>
+          <label>节点组<input id="nodeGroupSearch" placeholder="节点组" /></label>
+          <label>落地<input id="nodeSearch" placeholder="IP或域名" /></label>
+          <label>端口<input id="nodePortSearch" type="number" placeholder="端口" /></label>
+          <label class="hidden">VPS<select id="nodeAliasFilter"></select></label>
+          <button class="btn primary" id="nodeSearchBtn">查询</button>
+          <button class="btn slate" id="nodeClearBtn">清空</button>
+          <button class="btn warning" id="queryAllOutboundBtn">查询当页出站</button>
+        </div>
+        <div class="batch-toolbar">
+          <div><strong>节点列表</strong> <span class="muted" id="nodeSummaryText">正在加载...</span></div>
+          <span>已选 <strong id="nodeSelectedCount">0</strong> 个</span>
+          <button class="btn danger" id="batchDeleteNodesBtn" disabled>批量删除</button>
+          <button class="btn warning" id="batchForceDeleteNodesBtn" disabled title="直接从本地移除，不连接远程服务器发布">强制移除</button>
+          <button class="btn secondary" id="batchRulesBtn" disabled>批量规则</button>
+          <button class="btn success" id="batchCopyLinksBtn" disabled>复制链接</button>
+          <button class="btn success" id="batchExportDocBtn" disabled>批量导出文档</button>
+          <button class="btn secondary" id="clearNodeSelectionBtn">取消选择</button>
+        </div>
+        <div class="table-card nodes-table-card">
+          <table class="nodes-table">
+            <thead>
+              <tr>
+                <th><input type="checkbox" id="selectAllNodesInput" /></th>
+                <th>VPS 别名</th>
+                <th>VPS IP</th>
+                <th>节点标签</th>
+                <th>协议</th>
+                <th>端口</th>
+                <th>IP/域名</th>
+                <th>出站IP</th>
+                <th>落地</th>
+                <th>操作</th>
+                <th>二维码</th>
+              </tr>
+            </thead>
+            <tbody id="nodeRows"></tbody>
+          </table>
+        </div>
+        <div class="pager-row">
+          <button class="btn secondary" id="nodePrevPageBtn">上一页</button>
+          <span class="muted" id="nodePageText">第 1 页</span>
+          <label class="page-size">每页<select id="nodePageSize"><option>100</option><option>200</option><option>300</option></select></label>
+          <button class="btn secondary" id="nodeNextPageBtn">下一页</button>
+        </div>
+      </section>
+
+      <section class="view-panel hidden" id="proxyView">
+        <div class="proxy-page">
+          <div class="detect-card">
+            <h2>检测位置与目标</h2>
+            <div class="target-options" id="proxyTargetOptions"></div>
+            <div class="muted">选择 VPS 时，检测连接将从该 VPS 发起；需要服务器允许 SSH 端口转发。</div>
+            <div class="proxy-target-url-row">
+              <label for="proxyTargetPreset"><strong>检测目标：</strong></label>
+              <select id="proxyTargetPreset" class="proxy-target-select">
+                <option value="https://cp.cloudflare.com/generate_204">Cloudflare 204 (默认 / 全球快速)</option>
+                <option value="https://www.google.com/generate_204">Google 204 (翻墙直通测试)</option>
+                <option value="https://www.apple.com/library/test/success.html">Apple 连通测试</option>
+                <option value="https://api.ipify.org">真实出口公网 IP (查落地出口)</option>
+                <option value="custom">自定义目标 URL...</option>
+              </select>
+              <input id="proxyCustomUrl" class="hidden proxy-custom-url-input" placeholder="输入自定义 URL (如 https://example.com/204)" />
+            </div>
+          </div>
+          <div class="detect-card">
+            <h2>节点列表</h2>
+            <textarea id="proxyNodes" rows="9" placeholder="每行一个节点，例如：&#10;ip:port:user:pass&#10;vmess://...&#10;vless://...&#10;trojan://..."></textarea>
+            <div class="proxy-action-row">
+              <div class="muted">支持 SOCKS5、HTTP、Trojan（TLS与协议握手）、VLESS Reality/TLS（SNI握手）、VMess、AnyTLS 等。</div>
+              <div class="detect-actions">
+                <span class="muted">并发</span>
+                <input id="proxyConcurrency" type="number" value="5" min="1" max="50" />
+                <button class="btn secondary" id="clearProxyBtn" type="button">清空</button>
+                <button class="btn danger hidden" id="cancelProxyBtn" type="button">停止检测</button>
+                <button class="btn primary" id="proxyBatchBtn" type="button">开始检测</button>
+              </div>
+            </div>
+          </div>
+          <div class="detect-card">
+            <div class="section-head">
+              <h2>检测结果</h2>
+              <div class="proxy-result-meta">
+                <span class="muted" id="proxyRunLocation">检测位置：未开始</span>
+                <span class="muted" id="proxySummaryText">未开始</span>
+              </div>
+            </div>
+            <div class="proxy-progress-container hidden" id="proxyProgressBox">
+              <div class="proxy-progress-bar"><div class="proxy-progress-fill" id="proxyProgressBar" style="width: 0%"></div></div>
+              <span class="proxy-progress-text" id="proxyProgressText">进度：0%</span>
+            </div>
+            <div class="proxy-filter-toolbar">
+              <div class="segmented proxy-filter-segmented">
+                <button class="segment active" type="button" data-proxy-filter="all" id="proxyFilterAll">全部 (0)</button>
+                <button class="segment" type="button" data-proxy-filter="ok" id="proxyFilterOk">仅正常 (0)</button>
+                <button class="segment" type="button" data-proxy-filter="fail" id="proxyFilterFail">仅失败 (0)</button>
+              </div>
+              <div class="proxy-export-actions">
+                <button class="btn secondary" id="copyProxyOkBtn" type="button" title="复制所有检测正常的节点原始链接">复制正常节点</button>
+                <button class="btn secondary" id="exportProxyTxtBtn" type="button" title="导出当前结果为 TXT 文件">导出 TXT</button>
+                <button class="btn success" id="exportProxyExcelBtn" type="button" title="导出检测明细报表为 Excel">导出 Excel</button>
+              </div>
+            </div>
+            <div class="table-card flat">
+              <table class="proxy-result-table">
+                <colgroup>
+                  <col class="proxy-node-col">
+                  <col class="proxy-tcp-col">
+                  <col class="proxy-url-col">
+                  <col class="proxy-status-col">
+                  <col class="proxy-country-col">
+                  <col class="proxy-isp-col">
+                  <col class="proxy-message-col">
+                </colgroup>
+                <thead>
+                  <tr>
+                    <th>节点</th>
+                    <th>TCP延迟</th>
+                    <th>URL延迟</th>
+                    <th>结果</th>
+                    <th>国家</th>
+                    <th>运营商</th>
+                    <th>说明</th>
+                  </tr>
+                </thead>
+                <tbody id="proxyResultRows">
+                  <tr><td colspan="7" class="muted center">暂无结果</td></tr>
+                </tbody>
+              </table>
+            </div>
+            <pre class="result hidden" id="tcpResult">暂无结果</pre>
+          </div>
+          <div class="hidden">
+            <input id="tcpHost" />
+            <input id="tcpPort" type="number" value="443" />
+            <button id="tcpTestBtn" type="button">TCP</button>
+          </div>
+        </div>
+      </section>
+
+      <section class="view-panel hidden" id="middleView">
+        <div class="middle-page">
+          <div class="detect-card">
+            <div class="section-head middle-settings-head">
+              <h2>中转设置</h2>
+              <button class="btn primary" id="saveMiddleSettingsBtn">保存</button>
+            </div>
+            <div class="middle-config-grid">
+              <label>中转网址<div class="filter-combo middle-history-combo" data-middle-history="relayUrls"><input id="middleRelayUrl" placeholder="例如：relay.example.com:443" autocomplete="off" /><button class="filter-combo-clear" type="button" aria-label="清除中转网址"></button><button class="filter-combo-toggle" type="button" aria-label="展开中转网址历史"></button><div class="filter-combo-menu hidden"></div></div></label>
+              <label>账号<div class="filter-combo middle-history-combo" data-middle-history="accounts"><input id="middleRelayUsername" placeholder="必填" autocomplete="off" /><button class="filter-combo-clear" type="button" aria-label="清除账号"></button><button class="filter-combo-toggle" type="button" aria-label="展开账号历史"></button><div class="filter-combo-menu hidden"></div></div></label>
+              <label>密码<input id="middleRelayPassword" type="password" placeholder="必填" autocomplete="off" /></label>
+              <label>入口ID<div class="filter-combo middle-history-combo" data-middle-history="entryIds"><input id="middleEntryId" placeholder="必填，例如：7" inputmode="numeric" autocomplete="off" /><button class="filter-combo-clear" type="button" aria-label="清除入口ID"></button><button class="filter-combo-toggle" type="button" aria-label="展开入口ID历史"></button><div class="filter-combo-menu hidden"></div></div></label>
+              <label>中转域名<div class="filter-combo middle-history-combo" data-middle-history="middleDomains"><input id="middleDomain" placeholder="必填，例如：relay.example.com" autocomplete="off" /><button class="filter-combo-clear" type="button" aria-label="清除中转域名"></button><button class="filter-combo-toggle" type="button" aria-label="展开中转域名历史"></button><div class="filter-combo-menu hidden"></div></div></label>
+            </div>
+            <div class="middle-options-row">
+              <label class="middle-reuse-label"><input type="checkbox" id="middleReuseExisting" checked /> <span>智能复用后台已有正常规则（同目标 IP:端口自动复用监听端口，避免重复创建耗尽端口配额）</span></label>
+            </div>
+          </div>
+          <div class="middle-workspace">
+            <div class="detect-card middle-panel">
+              <div class="section-head">
+                <h2>输入内容</h2>
+                <div class="middle-actions">
+                  <label class="btn secondary file-btn">上传文件<input id="middleInputFile" type="file" accept=".txt,.csv,.log,.list,.xlsx" /></label>
+                  <button class="btn secondary" id="clearMiddleBtn">清空</button>
+                  <button class="btn primary" id="convertMiddleBtn">生成</button>
+                </div>
+              </div>
+              <textarea id="middleInputText" rows="18" placeholder="每行一个节点链接或 host:port[:账号][:密码]&#10;支持导入 .xlsx 表格（自动智能识别节点链接列）"></textarea>
+            </div>
+            <div class="detect-card middle-panel">
+              <div class="section-head">
+                <h2>输出结果</h2>
+                <div class="middle-actions">
+                  <button class="btn secondary" id="copyMiddleBtn">复制</button>
+                  <button class="btn success" id="exportMiddleBtn">导出</button>
+                </div>
+              </div>
+              <textarea id="middleOutputText" rows="18" readonly placeholder="生成结果会显示在这里"></textarea>
+              <div class="muted middle-summary" id="middleSummaryText">未生成</div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="view-panel hidden" id="deletedView">
+        <div class="settings-card">
+          <label>定时执行<select id="autoEnabled"><option value="1">启用</option><option value="0">停用</option></select></label>
+          <label>连续失败天数<input id="autoFailureDays" type="number" value="3" /></label>
+          <label>检测时间<input id="autoCheckTime" type="time" value="03:00" /></label>
+          <label>并发<input id="autoConcurrency" type="number" value="10" min="1" max="100" /></label>
+          <label>时区<input id="autoTimezone" value="Asia/Shanghai" /></label>
+          <button class="btn secondary" id="scheduleToggleBtn">定时切换</button>
+          <button class="btn secondary" id="healthRecordsBtn">失败记录</button>
+          <label>立即执行范围<input id="runNowVpsInput" placeholder="可选：VPS 别名" /></label>
+          <button class="btn warning" id="runAutoDeleteBtn">立即执行</button>
+          <button class="btn primary" id="saveAutoDeleteBtn">保存配置</button>
+        </div>
+        <div class="filter-card">
+          <label>VPS 别名<input id="deletedFilterAlias" placeholder="模糊查询" /></label>
+          <label>VPS IP<input id="deletedFilterIp" placeholder="模糊查询" /></label>
+          <label>节点组<input id="deletedFilterGroup" placeholder="模糊查询" /></label>
+          <button class="btn primary" id="reloadDeletedBtn">查询</button>
+          <button class="btn slate" id="resetDeletedBtn">重置</button>
+        </div>
+        <div class="batch-toolbar">
+          <div>
+            <strong>记录列表</strong>
+            <span class="muted" id="deletedSummaryText">正在加载...</span>
+          </div>
+          <span>已选 <strong id="deletedSelectedCount">0</strong> 条</span>
+          <button class="btn secondary" id="copyDeletedOutboundBtn" disabled>复制出站</button>
+          <button class="btn secondary" id="testDeletedOutboundBtn" disabled>测试落地URL延迟</button>
+          <button class="btn success" id="batchRestoreDeletedBtn" disabled>批量恢复</button>
+          <button class="btn danger" id="batchDeleteDeletedBtn" disabled>批量删除</button>
+          <button class="btn secondary" id="refreshDeletedBtn">刷新</button>
+        </div>
+        <div class="table-card">
+          <table class="record-table">
+            <thead>
+              <tr>
+                <th><input type="checkbox" id="selectAllDeletedInput" /></th>
+                <th>删除时间</th>
+                <th>VPS别名</th>
+                <th>VPS IP</th>
+                <th>节点组</th>
+                <th>节点标签</th>
+                <th>协议</th>
+                <th>落地</th>
+                <th>URL延迟</th>
+                <th>详情</th>
+                <th>恢复</th>
+              </tr>
+            </thead>
+            <tbody id="deletedRows"></tbody>
+          </table>
+        </div>
+        <div class="pager-row">
+          <button class="btn secondary" id="deletedPrevPageBtn">上一页</button>
+          <span class="muted" id="deletedPageText">第 1 页</span>
+          <label class="page-size">每页<select id="deletedPageSize"><option>100</option><option>200</option><option>300</option><option>500</option><option>1000</option></select></label>
+          <button class="btn secondary" id="deletedNextPageBtn">下一页</button>
+        </div>
+      </section>
+
+      <section class="view-panel hidden" id="debugView">
+      </section>
+
+      <section class="view-panel hidden" id="backupsView">
+      </section>
+
+      <section class="view-panel hidden" id="recordsView">
+        <button id="addRecordBtn">添加记录</button>
+        <table><tbody id="recordRows"></tbody></table>
+      </section>
+      <section class="view-panel hidden" id="connectionsView">
+        <input id="connectionSearch" />
+        <textarea id="connectionImportText"></textarea>
+        <button id="searchConnectionBtn">搜索</button>
+        <button id="importConnectionBtn">导入</button>
+        <button id="exportConnectionBtn">导出</button>
+        <button id="clearConnectionBtn">清空</button>
+        <table><tbody id="connectionRows"></tbody></table>
+      </section>
+      <section class="view-panel hidden" id="rulesView">
+        <input id="ruleName" />
+        <input id="ruleDescription" />
+        <textarea id="ruleLines"></textarea>
+        <select id="ruleAlias"></select>
+        <input id="ruleFiles" />
+        <button id="saveRuleBtn">保存规则组</button>
+        <button id="applyRuleBtn">应用规则组</button>
+        <table><tbody id="ruleRows"></tbody></table>
+      </section>
+    </main>
+  </div>
+
+  <div class="modal hidden" id="nodeModal">
+    <div class="modal-card node-modal-card">
+      <div class="modal-head"><strong id="nodeModalTitle">新增节点</strong><button class="icon-btn" id="closeNodeModalBtn">x</button></div>
+      <div class="modal-body compact-modal-body">
+        <div class="form-section">
+          <div class="form-section-title">基础参数</div>
+          <div class="compact-grid">
+            <label>添加模式<select id="nodeAddMode"><option value="normal">普通</option><option value="batch">批量</option></select></label>
+            <label>VPS<input id="nodeVpsAliasDisplay" readonly /><input id="nodeVpsAlias" type="hidden" /></label>
+            <label>VPS 域名/IP<input id="nodeVpsAddress" readonly /></label>
+            <label>起始端口<input id="nodeStartPort" type="number" placeholder="自动" /></label>
+            <label>Reality SNI<input id="nodeRealitySni" value="stock.adobe.com" /></label>
+          </div>
+          <div class="protocol-row">
+            <label>入站协议<select id="nodeInboundProtocol"><option value="vless-reality">VLESS Reality</option><option value="vmess">VMess</option><option value="vless">VLESS</option><option value="trojan">Trojan</option><option value="anytls">AnyTLS</option></select></label>
+            <label>出站协议<select id="nodeOutboundProtocol"><option value="direct">Direct</option><option value="block">Block</option><option value="http">HTTP</option><option value="socks" selected>SOCKS</option><option value="shadowsocks">Shadowsocks</option><option value="vmess">VMess</option><option value="vless">VLESS</option><option value="trojan">Trojan</option><option value="anytls">AnyTLS</option></select></label>
+            <label class="checkbox-line"><input id="nodeRealityEnabled" type="checkbox" /> Reality</label>
+          </div>
+        </div>
+        <div class="form-section">
+          <div class="node-section-heading">
+            <div class="form-section-title">节点分组</div>
+            <button type="button" class="btn small outline" id="addNodeGroupBtn">添加一组</button>
+          </div>
+          <div class="node-group-list" id="nodeGroupsContainer"></div>
+          <div class="hidden" id="nodeBatchSection">
+            <label>批量节点内容<textarea id="nodeBatchGroupsText" rows="10" placeholder="节点组1名字&#10;&#10;ip:port:user:pass&#10;&#10;ip:port:user:pass&#10;ip:port:user:pass&#10;&#10;&#10;节点组2名字&#10;ip:port:user:pass&#10;&#10;ip:port:user:pass"></textarea></label>
+            <small class="muted">空行会自动忽略；能识别为落地的行算节点，其他非空行算新的节点组名。</small>
+          </div>
+        </div>
+        <div class="node-help-list">
+          <small class="muted">落地信息每行一个，普通协议支持 IP/域名:端口[:用户名][:密码]；AnyTLS 支持 IP/域名:端口:密码[:SNI]。</small>
+        </div>
+        <div class="node-progress hidden" id="nodeSaveProgress">
+          <div class="node-progress-result">
+            <span id="nodeSaveResult">请等待生成</span>
+            <button class="btn small primary hidden" id="viewNodeSaveResultBtn" type="button">查看</button>
+          </div>
+          <div class="node-progress-head">
+            <span id="nodeSaveProgressText">准备保存</span>
+            <span id="nodeSaveProgressPercent">0%</span>
+          </div>
+          <div class="node-progress-track"><div id="nodeSaveProgressBar"></div></div>
+        </div>
+      </div>
+      <div class="modal-actions"><button class="btn secondary" id="cancelNodeModalBtn">取消</button><button class="btn primary" id="saveNodeBtn">保存节点</button></div>
+    </div>
+  </div>
+
+  <div class="modal hidden" id="multiIpNodeModal">
+    <div class="modal-card compact-wide-modal-card">
+      <div class="modal-head"><strong id="multiIpNodeTitle">新增多IP节点</strong><button class="icon-btn" id="closeMultiIpNodeModalBtn">x</button></div>
+      <div class="modal-body compact-modal-body">
+        <div class="form-section">
+          <div class="form-section-title">基础参数</div>
+          <div class="compact-grid">
+            <label>VPS<input id="multiIpAlias" readonly /></label>
+            <label>节点组名称<input id="multiIpGroupName" placeholder="可空，例如: 8G" /></label>
+            <label>入站协议<select id="multiIpInboundProtocol"><option value="vless-reality">VLESS Reality</option><option value="vmess">VMess</option><option value="vless">VLESS</option><option value="trojan">Trojan</option><option value="anytls">AnyTLS</option><option value="socks">SOCKS5</option></select></label>
+            <label>起始端口<input id="multiIpStartPort" type="number" value="20000" /></label>
+            <label>Reality SNI<input id="multiIpRealitySni" value="stock.adobe.com" /></label>
+          </div>
+        </div>
+        <div class="form-section">
+          <div class="form-section-title">检测到未创建协议的 IP</div>
+          <textarea id="multiIpList" rows="8"></textarea>
+          <small class="muted" id="multiIpSummary">打开后自动检测服务器绑定 IP，并过滤已创建协议的 IP。</small>
+        </div>
+        <div class="node-progress hidden" id="multiIpProgress">
+          <div class="node-progress-result">
+            <span id="multiIpResult">请等待生成</span>
+            <button class="btn small primary hidden" id="viewMultiIpResultBtn" type="button">查看</button>
+          </div>
+          <div class="node-progress-head">
+            <span id="multiIpProgressText">准备执行</span>
+            <span id="multiIpProgressPercent">0%</span>
+          </div>
+          <div class="node-progress-track"><div id="multiIpProgressBar"></div></div>
+        </div>
+      </div>
+      <div class="modal-actions"><button class="btn secondary" id="cancelMultiIpNodeModalBtn">取消</button><button class="btn primary" id="saveMultiIpNodeBtn">生成并发布</button></div>
+    </div>
+  </div>
+
+  <div class="modal hidden" id="modifyModal">
+    <div class="modal-card">
+      <div class="modal-head"><strong>批量修改落地</strong><button class="icon-btn" id="closeModifyModalBtn">x</button></div>
+      <div class="modal-body compact-modal-body">
+        <input id="modifyAlias" type="hidden" />
+        <div class="form-section">
+          <div class="muted modal-help">每行一个，格式：ip:端口:用户名:新密码（按 IP 精确匹配，仅修改对应 IP 的落地节点）</div>
+          <textarea id="modifyOutboundLines" rows="8" placeholder="core-residential.evomi.com:1002:user:password"></textarea>
+          <div class="form-help-row" style="margin-top: 6px; display: flex; justify-content: space-between; align-items: center; font-size: var(--font-small, 12px);">
+            <span class="muted" id="modifyLinesCount">已识别 0 条有效落地配置</span>
+            <span class="muted" id="modifyLinesWarning" style="color: #e67e22;"></span>
+          </div>
+        </div>
+        <div class="node-progress hidden" id="modifyProgress">
+          <div class="node-progress-result">
+            <span id="modifyResult">准备修改</span>
+          </div>
+          <div class="node-progress-head">
+            <span id="modifyProgressText">准备执行</span>
+            <span id="modifyProgressPercent">0%</span>
+          </div>
+          <div class="node-progress-track"><div id="modifyProgressBar"></div></div>
+        </div>
+      </div>
+      <div class="modal-actions"><button class="btn secondary" id="cancelModifyModalBtn">取消</button><button class="btn primary" id="saveModifyBtn">保存修改</button></div>
+    </div>
+  </div>
+
+  <div class="modal hidden" id="batchRuleModal">
+    <div class="modal-card">
+      <div class="modal-head"><strong>批量规则</strong><button class="icon-btn" id="closeBatchRuleModalBtn">x</button></div>
+      <div class="modal-body compact-modal-body">
+        <div class="form-section">
+          <div class="form-section-title">选择规则组</div>
+          <div class="compact-grid">
+            <label>规则组<select id="batchRuleName"></select></label>
+            <label>操作<select id="batchRuleAction"><option value="add">应用规则组</option><option value="remove">移除规则组</option></select></label>
+          </div>
+          <div class="muted modal-help" id="batchRuleSelectedText">已选 0 个节点</div>
+        </div>
+        <div class="form-section">
+          <div class="form-section-title">规则内容</div>
+          <pre class="rule-preview" id="batchRulePreview">请选择规则组</pre>
+        </div>
+        <div class="node-progress hidden" id="batchRuleProgress">
+          <div class="node-progress-result"><span id="batchRuleResult">准备执行</span></div>
+          <div class="node-progress-head">
+            <span id="batchRuleProgressText">准备执行</span>
+            <span id="batchRuleProgressPercent">0%</span>
+          </div>
+          <div class="node-progress-track"><div id="batchRuleProgressBar"></div></div>
+        </div>
+      </div>
+      <div class="modal-actions"><button class="btn secondary" id="cancelBatchRuleModalBtn">取消</button><button class="btn primary" id="applyBatchRuleBtn">执行</button></div>
+    </div>
+  </div>
+
+  <div class="modal hidden" id="recordModal">
+    <div class="modal-card">
+      <div class="modal-head"><strong>节点记录</strong><button class="icon-btn" id="closeRecordModalBtn">x</button></div>
+      <div class="form-grid">
+        <label>国家<input id="recordCountry" /></label>
+        <label>数量<input id="recordQuantity" type="number" value="1" /></label>
+        <label>创建日期<input id="recordCreatedDate" type="date" /></label>
+        <label>续费日期<input id="recordRenewalDate" type="date" /></label>
+      </div>
+      <div class="form-grid one"><label>备注<textarea id="recordRemark" rows="4"></textarea></label></div>
+      <div class="modal-actions"><button class="btn secondary" id="cancelRecordModalBtn">取消</button><button class="btn primary" id="saveRecordBtn">保存</button></div>
+    </div>
+  </div>
+
+  <div class="modal hidden" id="detailModal">
+    <div class="modal-card">
+      <div class="modal-head"><strong id="detailTitle">详情</strong><button class="icon-btn" id="closeDetailModalBtn">x</button></div>
+      <div class="modal-body">
+        <pre class="detail-json" id="detailContent">{}</pre>
+        <div class="node-progress hidden" id="detailProgress" style="margin-top: 12px;">
+          <div class="node-progress-result"><span id="detailProgressResult">正在保存并部署...</span></div>
+          <div class="node-progress-head">
+            <span id="detailProgressText">准备执行</span>
+            <span id="detailProgressPercent">0%</span>
+          </div>
+          <div class="node-progress-track"><div id="detailProgressBar"></div></div>
+        </div>
+      </div>
+      <div class="modal-actions detail-actions hidden" id="detailActions">
+        <button class="btn secondary hidden" id="copyDetailJsonBtn">复制JSON</button>
+        <button class="btn warning hidden" id="editDetailJsonBtn">编辑</button>
+        <button class="btn primary hidden" id="saveDetailJsonBtn">保存并部署</button>
+        <button class="btn secondary" id="exportDetailLogBtn">导出日志</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="modal hidden" id="qrModal">
+    <div class="modal-card qr-modal-card">
+      <div class="modal-head">
+        <strong>节点二维码</strong>
+        <button class="icon-btn" id="closeQrModalBtn" aria-label="关闭">x</button>
+      </div>
+      <div class="modal-body qr-modal-body">
+        <img id="qrImage" alt="节点二维码" />
+        <div class="qr-node-name" id="qrNodeName"></div>
+        <label class="qr-link-field" for="qrLink">节点链接</label>
+        <textarea id="qrLink" readonly></textarea>
+      </div>
+      <div class="modal-actions">
+        <button class="btn secondary" id="copyQrLinkBtn">复制链接</button>
+        <button class="btn primary" id="closeQrModalBtn2">关闭</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="modal hidden" id="confirmModal">
+    <div class="modal-card confirm-card">
+      <div class="modal-head">
+        <strong id="confirmTitle">确认操作</strong>
+        <button class="icon-btn" id="confirmCloseBtn">x</button>
+      </div>
+      <div class="modal-body confirm-body">
+        <div id="confirmMessage" class="confirm-message"></div>
+        <input id="confirmInput" class="hidden" />
+      </div>
+      <div class="modal-actions">
+        <button class="btn secondary" id="confirmCancelBtn">取消</button>
+        <button class="btn primary" id="confirmOkBtn">确认</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="modal hidden" id="exportModeModal">
+    <div class="modal-card export-mode-card">
+      <div class="export-mode-actions">
+        <button class="btn primary" id="exportSingleNodeBtn">单个导出</button>
+        <button class="btn success" id="exportBatchNodeBtn">批次导出</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="modal hidden" id="healthModal">
+    <div class="modal-card wide">
+      <div class="modal-head">
+        <strong>连续失败记录</strong>
+        <div class="modal-tools">
+          <button class="btn danger small" id="clearHealthBtn">删除全部</button>
+          <button class="icon-btn" id="closeHealthModalBtn">x</button>
+        </div>
+      </div>
+      <div class="table-card flat">
+        <table class="health-table">
+          <thead><tr><th>VPS别名</th><th>VPS IP</th><th>节点组</th><th>节点标签</th><th>入站端口</th><th>连续失败</th><th>最后失败日</th><th>最后错误</th></tr></thead>
+          <tbody id="healthRows"></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <div class="modal hidden" id="backupModal">
+    <div class="modal-card wide">
+      <div class="modal-head">
+        <strong id="backupModalTitle">备份还原</strong>
+        <button class="icon-btn" id="closeBackupModalBtn">x</button>
+      </div>
+      <div class="modal-body backup-modal-body">
+        <div class="manager-shell modal-manager-shell">
+          <div class="manager-toolbar">
+            <label>备份来源<select id="backupAliasFilter"></select></label>
+            <button class="btn primary" id="backupNowBtn">立即备份</button>
+            <button class="btn secondary" id="restoreJsonBtn">保存还原 JSON</button>
+            <button class="btn secondary" id="refreshBackupsBtn">刷新</button>
+            <span class="muted">默认展示本机备份；切换“备份来源”可选择其他机器的备份一键还原到当前本机（如将出问题主机的配置还原到新主机）。</span>
+          </div>
+          <div class="backup-list-wrap">
+            <div class="table-card flat">
+              <table class="backup-table">
+                <thead><tr><th>归属 VPS</th><th>文件名</th><th>大小</th><th>修改时间</th><th>操作</th></tr></thead>
+                <tbody id="backupRows"></tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+        <div class="node-progress hidden" id="backupProgress" style="margin-top: 12px;">
+          <div class="node-progress-result"><span id="backupProgressResult">准备执行</span></div>
+          <div class="node-progress-head">
+            <span id="backupProgressText">准备执行</span>
+            <span id="backupProgressPercent">0%</span>
+          </div>
+          <div class="node-progress-track"><div id="backupProgressBar"></div></div>
+        </div>
+      </div>
+      <div class="modal-actions"><button class="btn secondary" id="closeBackupModalBtn2">关闭</button></div>
+    </div>
+  </div>
+
+  <div class="modal hidden" id="debugModal">
+    <div class="modal-card wide">
+      <div class="modal-head">
+        <strong id="debugModalTitle">VPS 调试</strong>
+        <button class="icon-btn" id="closeDebugModalBtn">x</button>
+      </div>
+      <div class="modal-body debug-modal-body">
+        <div class="debug-shell modal-debug-shell">
+          <div class="debug-tabs">
+            <button class="debug-tab active" type="button">基础诊断</button>
+            <button class="debug-tab" type="button">IPerf3 测速</button>
+          </div>
+          <div class="debug-form-card" id="debugBasicPanel">
+            <div class="debug-input-grid">
+              <label>VPS<select id="debugAlias"></select></label>
+              <label>目标 IP/域名<input id="debugTarget" placeholder="192.0.2.1 或 example.com" /></label>
+              <label>端口<input id="debugPort" type="number" value="443" /></label>
+              <button class="btn secondary" id="debugClearBtn">清空结果</button>
+            </div>
+            <div class="debug-card-grid">
+              <div class="debug-card">
+                <h2>MTR 路由诊断</h2>
+                <p>查看网络路径、丢包和延迟变化。</p>
+                <button class="btn primary" id="debugMtrBtn">开始 MTR</button>
+              </div>
+              <div class="debug-card">
+                <h2>Ping 延迟</h2>
+                <p>快速测试目标连通性和基础延迟。</p>
+                <button class="btn success" id="debugPingBtn">开始 Ping</button>
+              </div>
+              <div class="debug-card">
+                <h2>IP + 端口</h2>
+                <p>检测目标端口是否可连接。</p>
+                <button class="btn warning" id="debugPortBtn">检测端口</button>
+              </div>
+            </div>
+          </div>
+          <div class="debug-form-card hidden" id="debugIperfPanel">
+            <div class="debug-input-grid iperf-grid">
+              <label>当前 VPS<select id="debugIperfCurrent"></select></label>
+              <label>测速目标 VPS<select id="debugIperfTarget"></select></label>
+              <button class="btn primary" id="debugIperfBtn">开始测速</button>
+              <span class="muted">用于 VPS 之间带宽测速。</span>
+            </div>
+          </div>
+          <div class="debug-summary" id="debugSummary">选择功能后会在这里显示中文说明。</div>
+          <div class="debug-output-layout">
+            <div class="debug-output-panel">
+              <div class="debug-output-title">原始输出</div>
+              <pre class="debug-result" id="debugResult">等待操作...</pre>
+            </div>
+            <div class="debug-output-panel">
+              <div class="debug-output-title">结果分析</div>
+              <div class="debug-analysis" id="debugAnalysis">MTR 开始后，这里显示简短结论：路径、最终延迟、丢包和异常点。</div>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="modal-actions"><button class="btn secondary" id="closeDebugModalBtn2">关闭</button></div>
+    </div>
+  </div>
+
+  <div class="modal hidden" id="singboxLogModal">
+    <div class="modal-card wide">
+      <div class="modal-head">
+        <strong id="singboxLogModalTitle">sing-box 运行日志</strong>
+        <button class="icon-btn" id="closeSingboxLogModalBtn">x</button>
+      </div>
+      <div class="modal-body compact-modal-body">
+        <div class="singbox-log-toolbar">
+          <label>VPS <select id="singboxLogAlias"></select></label>
+          <label>行数
+            <select id="singboxLogLines">
+              <option value="100">100 行</option>
+              <option value="200" selected>200 行</option>
+              <option value="500">500 行</option>
+              <option value="1000">1000 行</option>
+            </select>
+          </label>
+          <button class="btn primary small" id="refreshSingboxLogBtn" type="button">刷新日志</button>
+          <button class="btn secondary small" id="copySingboxLogBtn" type="button">复制日志</button>
+          <button class="btn secondary small" id="clearSingboxLogBtn" type="button">清空显示</button>
+          <span class="muted singbox-log-status" id="singboxLogStatus"></span>
+        </div>
+        <pre class="debug-result singbox-log-pre" id="singboxLogContent">等待加载日志...</pre>
+      </div>
+      <div class="modal-actions"><button class="btn secondary" id="closeSingboxLogModalBtn2">关闭</button></div>
+    </div>
+  </div>
+
+  <div class="modal hidden" id="vpsModal">
+    <div class="modal-card vps-edit-card">
+      <div class="modal-head"><strong id="modalTitle">添加 VPS</strong><button class="icon-btn" id="closeModalBtn">x</button></div>
+      <div class="modal-body compact-modal-body">
+        <div class="form-section">
+          <div class="form-section-title">连接信息</div>
+          <div class="compact-grid">
+            <label>别名 (唯一ID)<input id="vpsAlias" /></label>
+            <label>IP 地址<input id="vpsAddress" /></label>
+            <label>SSH 端口<input id="vpsPort" type="number" value="22" /></label>
+            <label>SSH 用户名<input id="vpsUsername" value="root" /></label>
+            <label>国家代码<input id="vpsCountryCode" placeholder="自动识别，或填写 US / HK / SG" maxlength="2" /></label>
+          </div>
+        </div>
+        <div class="form-section">
+          <div class="form-section-title">认证与域名</div>
+          <div class="compact-grid">
+            <label>认证方式<select id="vpsAuthMethod"><option value="password">密码认证</option><option value="key">密钥认证</option></select></label>
+            <label id="vpsPasswordField">SSH 密码<input id="vpsPassword" type="password" /></label>
+            <label id="vpsKeyPathField" class="hidden">SSH 私钥文件绝对路径<input id="vpsKeyPath" /></label>
+            <label>入站域名<input id="vpsDomain" /></label>
+            <label>中转域名<input id="vpsMiddleDomain" /></label>
+          </div>
+        </div>
+      </div>
+      <div class="modal-actions"><button class="btn secondary" id="cancelModalBtn">取消</button><button class="btn primary" id="saveVpsBtn">保存</button></div>
+    </div>
+  </div>
+
+  <div class="modal hidden" id="trafficModal">
+    <div class="modal-card wide">
+      <div class="modal-head"><strong id="trafficTitle">流量排行</strong><button class="icon-btn" id="closeTrafficModalBtn">x</button></div>
+      <div class="modal-body">
+        <div class="traffic-toolbar">
+          <div class="segmented">
+            <button class="segment active" type="button" data-limit="10">Top10</button>
+            <button class="segment" type="button" data-limit="20">Top20</button>
+            <button class="segment" type="button" data-limit="50">Top50</button>
+          </div>
+          <span class="muted" id="trafficStatus">等待采集</span>
+        </div>
+        <div class="debug-tabs traffic-tabs">
+          <button class="debug-tab active" type="button">实时上下行</button>
+          <button class="debug-tab" type="button">端口总流量</button>
+        </div>
+        <div class="table-card flat">
+          <table class="traffic-table">
+            <thead id="trafficHead"><tr><th>排名</th><th>端口</th><th>节点名</th><th>节点组</th><th>协议</th><th>实时下行</th><th>实时上行</th><th>合计</th><th>连接数</th></tr></thead>
+            <tbody id="trafficRows"><tr><td colspan="9" class="muted center">暂无可显示数据</td></tr></tbody>
+          </table>
+        </div>
+      </div>
+      <div class="modal-actions"><button class="btn secondary" id="refreshTrafficBtn">刷新</button><button class="btn secondary" id="closeTrafficModalBtn2">关闭</button></div>
+    </div>
+  </div>
+
+  <div class="modal hidden" id="middleLogModal">
+    <div class="modal-card wide middle-log-card">
+      <div class="modal-head">
+        <strong>中转加速日志</strong>
+        <button class="icon-btn" id="closeMiddleLogModalBtn">x</button>
+      </div>
+      <div class="modal-body">
+        <pre class="middle-log-output" id="middleLogOutput">等待开始...</pre>
+      </div>
+      <div class="modal-actions"><button class="btn secondary" id="closeMiddleLogModalBtn2">关闭</button></div>
+    </div>
+  </div>
+
+  <div class="modal result-modal hidden" id="toast" role="dialog" aria-modal="true" aria-labelledby="toastTitle">
+    <div class="modal-card result-modal-card">
+      <div class="modal-head">
+        <strong id="toastTitle">操作提示</strong>
+        <button class="icon-btn" id="closeToastBtn" aria-label="关闭">x</button>
+      </div>
+      <div class="modal-body result-modal-body">
+        <div class="result-modal-message" id="toastMessage"></div>
+      </div>
+      <div class="modal-actions">
+        <button class="btn primary" id="toastOkBtn">确定</button>
+      </div>
+    </div>
+  </div>
+  <script type="module" src="./main.js"></script>
+</body>
+</html>

@@ -1,0 +1,20 @@
+SanTianShell 随包工具说明
+
+IPerf3 3.21
+- 项目：https://github.com/esnet/iperf
+- Windows 构建：https://github.com/userdocs/iperf3-static/releases/tag/3.21
+- 发布文件：https://github.com/userdocs/iperf3-static/releases/download/3.21/iperf3-amd64-win.zip
+- 发布 ZIP SHA256：425C87F0618D0527C959E1C2EDCB213C5383F87522D31E9E7F5220AB49371AFA
+- iperf3.exe SHA256：A355CFFF5AD4830BA84737DDD745644ADD33EFCCC1466CFFF6011279219550BD
+- 完整许可见 licenses/iperf3-LICENSE.txt。
+
+Cygwin Runtime 3.6.7-1
+- cygwin1.dll SHA256：0AB76B4724499DF54B75B7FA701788F1E77425CE65C8BCA0A9F2120598BB8A70
+- 许可与 Linking Exception：https://cygwin.com/licensing.html
+- 源码获取：https://cygwin.com/git.html
+- 完整许可见 licenses/Cygwin-COPYING.LIB.txt 与 licenses/Cygwin-Licensing.html。
+
+架构说明
+- IPerf3 工具本身为 Windows x64 构建。
+- Windows x64 包直接运行。
+- Windows ARM64 包仅在 Windows 11 ARM 的 x64 仿真环境下运行该工具，不是原生 ARM64 IPerf3。

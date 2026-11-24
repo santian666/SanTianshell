@@ -1,0 +1,17 @@
+{
+  "$schema": "https://wails.io/schemas/config.v2.json",
+  "name": "SanTianShell",
+  "outputfilename": "SanTianShell",
+  "frontend:install": "npm.cmd install",
+  "frontend:build": "npm.cmd run build",
+  "frontend:dev:watcher": "npm.cmd run dev",
+  "frontend:dev:serverUrl": "auto",
+  "author": { "name": "SanTianShell" },
+  "info": {
+    "companyName": "SanTianShell",
+    "productName": "SanTianShell",
+    "productVersion": "0.1.35",
+    "copyright": "Copyright SanTianShell",
+    "comments": "SSH、RDP、SFTP、系统监控、节点模式和 AI 辅助工具"
+  }
+}

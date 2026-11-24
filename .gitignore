@@ -1,0 +1,22 @@
+# Local runtime data & node/server configs (NEVER commit)
+data/
+*.db
+*.dat
+*.log
+*.bak
+testfile
+.tmp/
+debug/
+
+# Build & release artifacts
+build/bin/
+build/.gocache/
+build/.gocache-final/
+build/.test-cache/
+release/
+frontend/dist/
+frontend/node_modules/
+*.exe
+*.zip
+*.msi
+*.old
