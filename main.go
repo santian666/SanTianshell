@@ -5,6 +5,7 @@ import (
 	"embed"
 	"log/slog"
 	"os"
+	"time"
 
 	"santianshell/internal/diaglog"
 	"santianshell/internal/nodemode"
@@ -19,8 +20,50 @@ import (
 //go:embed frontend/dist
 var assets embed.FS
 
+func hasUpdateRestartArg(args []string) bool {
+	for _, arg := range args {
+		if arg == updateRestartArg {
+			return true
+		}
+	}
+	return false
+}
+
+func isUpdateRestart(args []string) bool {
+	if hasUpdateRestartArg(args) {
+		return true
+	}
+	if exePath, err := os.Executable(); err == nil && exePath != "" {
+		if _, statErr := os.Stat(exePath + ".old"); statErr == nil {
+			return true
+		}
+	}
+	return false
+}
+
+func acquireAppSingleInstance(args []string, waitTimeout time.Duration) (singleton.Handle, bool, error) {
+	waitForRestart := isUpdateRestart(args)
+	deadline := time.Now().Add(waitTimeout)
+	for {
+		instance, alreadyRunning, err := singleton.Acquire(`SanTianShell.SingleInstance`, "SanTianShell")
+		if err != nil {
+			return 0, false, err
+		}
+		if !alreadyRunning {
+			return instance, false, nil
+		}
+		if !waitForRestart || time.Now().After(deadline) {
+			return instance, true, nil
+		}
+		if instance != 0 {
+			singleton.Release(instance)
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+}
+
 func main() {
-	instance, alreadyRunning, instanceErr := singleton.Acquire(`SanTianShell.SingleInstance`, "SanTianShell")
+	instance, alreadyRunning, instanceErr := acquireAppSingleInstance(os.Args[1:], 15*time.Second)
 	if instanceErr != nil {
 		slog.Error("创建单实例锁失败", "错误", instanceErr)
 		os.Exit(1)

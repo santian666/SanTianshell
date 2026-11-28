@@ -145,3 +145,12 @@ func TestExtractZipArchiveRejectsExcessFileCount(t *testing.T) {
 		t.Fatalf("expected extractZipArchive to reject archive with >%d files", appUpdateMaxZipFiles)
 	}
 }
+
+func TestHasUpdateRestartArg(t *testing.T) {
+	if hasUpdateRestartArg(nil) || hasUpdateRestartArg([]string{"--foo"}) {
+		t.Fatalf("expected false when restart arg absent")
+	}
+	if !hasUpdateRestartArg([]string{"--foo", updateRestartArg}) {
+		t.Fatalf("expected true when %q present", updateRestartArg)
+	}
+}

@@ -22,6 +22,7 @@ import (
 const (
 	defaultAppUpdateRepo   = "santian666/SanTianShell"
 	defaultGitHubAPIBase   = "https://api.github.com"
+	updateRestartArg       = "--update-restart"
 	appUpdateCheckTimeout  = 15 * time.Second
 	appUpdateDownloadLimit = 300 * 1024 * 1024
 	appUpdateMaxZipFiles   = 1000
@@ -486,7 +487,7 @@ func performAtomicInPlaceUpdate(extractedAppDir, exePath string) error {
 }
 
 func launchNewAppProcess(exePath, workDir string) error {
-	cmd := exec.Command(exePath)
+	cmd := exec.Command(exePath, updateRestartArg)
 	cmd.Dir = workDir
 	cmd.SysProcAttr = &syscall.SysProcAttr{
 		CreationFlags: syscall.CREATE_NEW_PROCESS_GROUP,
@@ -666,7 +667,7 @@ func (a *App) ApplyAppUpdate() error {
 	}
 
 	go func() {
-		time.Sleep(450 * time.Millisecond)
+		time.Sleep(150 * time.Millisecond)
 		if ctx, err := a.runtimeContext(); err == nil {
 			runtime.Quit(ctx)
 		}
