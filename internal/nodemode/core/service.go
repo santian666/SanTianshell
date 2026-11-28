@@ -2,6 +2,7 @@ package core
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -38,10 +39,39 @@ type Service struct {
 	nodeCacheMu           sync.Mutex
 	nodeCacheSignature    string
 	nodeCache             []NodeSummary
-	middleSettingsMu      sync.Mutex
-	autoDeleteRunMu       sync.Mutex
-	autoDeleteSchedulerMu sync.Mutex
-	lastAutoDeleteDate    string
+	middleSettingsMu        sync.Mutex
+	autoDeleteRunMu         sync.Mutex
+	autoDeleteSchedulerMu   sync.Mutex
+	autoDeleteSchedulerOnce sync.Once
+	lastAutoDeleteDate      string
+	dbMu                    sync.Mutex
+	persistentDB            bool
+	sharedDB                *sql.DB
+	schemaReady             bool
+}
+
+func (s *Service) EnablePersistentDB() {
+	if s == nil {
+		return
+	}
+	s.dbMu.Lock()
+	s.persistentDB = true
+	s.dbMu.Unlock()
+}
+
+func (s *Service) Close() error {
+	if s == nil {
+		return nil
+	}
+	s.dbMu.Lock()
+	db := s.sharedDB
+	s.sharedDB = nil
+	s.schemaReady = false
+	s.dbMu.Unlock()
+	if db != nil {
+		return db.Close()
+	}
+	return nil
 }
 
 func (s *Service) lockNodeConfigAliases(aliases ...string) func() {
@@ -935,9 +965,6 @@ func (s *Service) queryIPInfo(key string) IPInfo {
 	if info, ok := queryIPInfoIO(client, key); ok {
 		return info
 	}
-	if info, ok := queryIPAPI(client, key); ok {
-		return info
-	}
 	return IPInfo{Country: "--", ISP: "-", IP: key, Resolved: true}
 }
 
@@ -1003,33 +1030,6 @@ func queryIPInfoIO(client http.Client, key string) (IPInfo, bool) {
 		return IPInfo{}, false
 	}
 	return IPInfo{Country: strings.ToUpper(payload.Country), ISP: firstNonEmpty(payload.Org, "-"), IP: firstNonEmpty(payload.IP, key), Resolved: true}, true
-}
-
-func queryIPAPI(client http.Client, key string) (IPInfo, bool) {
-	resp, err := client.Get("http://ip-api.com/json/" + key + "?fields=status,countryCode,isp,org,as,query")
-	if err != nil {
-		return IPInfo{}, false
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return IPInfo{}, false
-	}
-	data, err := readLimitedHTTPBody(resp.Body, 1<<20)
-	if err != nil {
-		return IPInfo{}, false
-	}
-	var payload struct {
-		Status      string `json:"status"`
-		CountryCode string `json:"countryCode"`
-		ISP         string `json:"isp"`
-		Org         string `json:"org"`
-		AS          string `json:"as"`
-		Query       string `json:"query"`
-	}
-	if json.Unmarshal(data, &payload) != nil || payload.Status != "success" || payload.CountryCode == "" {
-		return IPInfo{}, false
-	}
-	return IPInfo{Country: strings.ToUpper(payload.CountryCode), ISP: firstNonEmpty(payload.ISP, payload.Org, payload.AS, "-"), IP: firstNonEmpty(payload.Query, key), Resolved: true}, true
 }
 
 func parseNode(alias, fileName string, data json.RawMessage) NodeSummary {

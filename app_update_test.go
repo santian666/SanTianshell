@@ -79,3 +79,69 @@ func TestAppUpdateCheckAndValidateZip(t *testing.T) {
 		t.Fatalf("expected zip asset selected, got %q", info.AssetName)
 	}
 }
+
+func TestAppUpdateAndInfoRespectLockState(t *testing.T) {
+	a := &App{unlocked: false}
+	if _, err := a.CheckAppUpdate(); err == nil {
+		t.Fatalf("expected CheckAppUpdate to fail while locked")
+	}
+	if err := a.ApplyAppUpdate(); err == nil {
+		t.Fatalf("expected ApplyAppUpdate to fail while locked")
+	}
+	if _, err := a.DeleteHosts(nil); err == nil || err.Error() != "软件已锁定，请先输入密保" {
+		t.Fatalf("expected DeleteHosts(nil) to fail with lock error, got %v", err)
+	}
+	lockedInfo := a.GetAppInfo()
+	if lockedInfo.DataDir != "" || lockedInfo.LogDir != "" {
+		t.Fatalf("expected DataDir/LogDir hidden while locked, got %+v", lockedInfo)
+	}
+	a.unlocked = true
+	unlockedInfo := a.GetAppInfo()
+	if unlockedInfo.DataDir == "" || unlockedInfo.LogDir == "" {
+		t.Fatalf("expected DataDir/LogDir visible while unlocked, got %+v", unlockedInfo)
+	}
+}
+
+func TestDownloadUpdateAssetStops416Recursion(t *testing.T) {
+	var hits int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		w.WriteHeader(http.StatusRequestedRangeNotSatisfiable)
+	}))
+	defer srv.Close()
+
+	dest := filepath.Join(t.TempDir(), "update.zip")
+	if err := os.WriteFile(dest, []byte("partial"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	err := downloadUpdateAsset(srv.URL, dest, 1024, nil)
+	if err == nil {
+		t.Fatalf("expected error on repeated 416 response")
+	}
+	if hits != 2 {
+		t.Fatalf("expected exactly 2 attempts (initial + 1 retry), got %d", hits)
+	}
+}
+
+func TestExtractZipArchiveRejectsExcessFileCount(t *testing.T) {
+	dir := t.TempDir()
+	zipPath := filepath.Join(dir, "many.zip")
+	f, err := os.Create(zipPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	zw := zip.NewWriter(f)
+	for i := 0; i <= appUpdateMaxZipFiles; i++ {
+		w, err := zw.Create(filepath.Join("dir", "f_"+string(rune('a'+(i%26)))+"_"+filepath.Base(t.Name())+string(rune('0'+(i%10)))+string(rune('0'+((i/10)%10)))+string(rune('0'+((i/100)%10)))+string(rune('0'+((i/1000)%10)))))
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, _ = w.Write([]byte("x"))
+	}
+	_ = zw.Close()
+	_ = f.Close()
+
+	if err := extractZipArchive(zipPath, filepath.Join(dir, "out")); err == nil {
+		t.Fatalf("expected extractZipArchive to reject archive with >%d files", appUpdateMaxZipFiles)
+	}
+}

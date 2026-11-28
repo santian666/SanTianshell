@@ -2345,8 +2345,10 @@ func commandExecutableFields(command string) []string {
 	return fields
 }
 
+var sensitiveReadOnlyPathPattern = regexp.MustCompile(`(?i)(/etc/(?:shadow|gshadow|master\.passwd|sudoers(?:\.d/\S*)?)|(?:^|[/\s'"=])(?:\.ssh/(?:id_[a-z0-9_.-]+|authorized_keys)|id_(?:rsa|ed25519|ecdsa|dsa)|\.aws/credentials|\.kube/config|\.netrc|\.pgpass|\.my\.cnf|\.env(?:\.[a-z0-9_-]+)?|privkey\.pem)|/proc/[^/\s]+/environ)`)
+
 func readOnlyCommand(command string) bool {
-	if highRiskCommand.MatchString(command) || shellEvalCommand.MatchString(command) || pipeToShell.MatchString(command) || databaseMutation.MatchString(command) || unsupportedShellControl.MatchString(command) {
+	if highRiskCommand.MatchString(command) || shellEvalCommand.MatchString(command) || pipeToShell.MatchString(command) || databaseMutation.MatchString(command) || unsupportedShellControl.MatchString(command) || sensitiveReadOnlyPathPattern.MatchString(command) {
 		return false
 	}
 	if readOnlyPackageQuery(command) {

@@ -44,7 +44,16 @@ func New(connector, interactiveConnector func(string, string, int) (*ssh.Client,
 		resolver = passwordResolver[0]
 	}
 	service := core.NewServiceWithConnectorsAndResolver(directory, wrap(connector), wrap(interactiveConnector), resolver)
+	service.EnablePersistentDB()
 	return &App{service: service, dataDirectoryWarning: warning}
+}
+
+// Close releases persistent resources such as the SQLite database connection on shutdown.
+func Close(a *App) error {
+	if a == nil || a.service == nil {
+		return nil
+	}
+	return a.service.Close()
 }
 
 // SetAccessGuard configures a lock check invoked before Wails-bound node operations.

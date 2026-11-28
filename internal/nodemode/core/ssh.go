@@ -1460,10 +1460,12 @@ func (s *Service) connectSSHOnce(vps VPS, timeoutSeconds int) (*ssh.Client, erro
 		return nil, errors.New("未配置 SSH 密码或密钥")
 	}
 	config := &ssh.ClientConfig{
-		User:            vps.Username,
-		Auth:            authMethods,
-		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
-		Timeout:         time.Duration(timeoutSeconds) * time.Second,
+		User: vps.Username,
+		Auth: authMethods,
+		HostKeyCallback: func(hostname string, _ net.Addr, _ ssh.PublicKey) error {
+			return fmt.Errorf("拒绝未经验证的 SSH 主机密钥 (%s): 请通过主界面主机管理确认并保存主机指纹", hostname)
+		},
+		Timeout: time.Duration(timeoutSeconds) * time.Second,
 	}
 	address := net.JoinHostPort(vps.Address, strconv.Itoa(vps.Port))
 	dialConfig, err := vps.proxyDialConfig()

@@ -24,6 +24,9 @@ const (
 	defaultGitHubAPIBase   = "https://api.github.com"
 	appUpdateCheckTimeout  = 15 * time.Second
 	appUpdateDownloadLimit = 300 * 1024 * 1024
+	appUpdateMaxZipFiles   = 1000
+	appUpdateMaxFileBytes  = 200 * 1024 * 1024
+	appUpdateMaxTotalBytes = 500 * 1024 * 1024
 )
 
 type AppUpdateInfo struct {
@@ -255,12 +258,18 @@ func isValidUpdateZip(zipPath string, expectedSize int64) bool {
 }
 
 func downloadUpdateAsset(downloadURL, destPath string, expectedSize int64, onProgress func(downloaded, total int64, speed string, percent float64)) error {
+	return downloadUpdateAssetAttempt(downloadURL, destPath, expectedSize, onProgress, true)
+}
+
+func downloadUpdateAssetAttempt(downloadURL, destPath string, expectedSize int64, onProgress func(downloaded, total int64, speed string, percent float64), allowRangeRetry bool) error {
 	var existingSize int64
-	if fi, err := os.Stat(destPath); err == nil && fi.Size() > 0 {
-		if expectedSize > 0 && fi.Size() < expectedSize {
-			existingSize = fi.Size()
-		} else if expectedSize > 0 && fi.Size() > expectedSize {
-			_ = os.Remove(destPath)
+	if allowRangeRetry {
+		if fi, err := os.Stat(destPath); err == nil && fi.Size() > 0 {
+			if expectedSize > 0 && fi.Size() < expectedSize {
+				existingSize = fi.Size()
+			} else if expectedSize > 0 && fi.Size() > expectedSize {
+				_ = os.Remove(destPath)
+			}
 		}
 	}
 
@@ -281,8 +290,11 @@ func downloadUpdateAsset(downloadURL, destPath string, expectedSize int64, onPro
 	defer resp.Body.Close()
 
 	if resp.StatusCode == http.StatusRequestedRangeNotSatisfiable {
+		if !allowRangeRetry {
+			return errors.New("下载服务器持续返回 416 Range Not Satisfiable")
+		}
 		_ = os.Remove(destPath)
-		return downloadUpdateAsset(downloadURL, destPath, expectedSize, onProgress)
+		return downloadUpdateAssetAttempt(downloadURL, destPath, expectedSize, onProgress, false)
 	}
 
 	var out *os.File
@@ -330,7 +342,12 @@ func extractZipArchive(zipPath, destDir string) error {
 	}
 	defer reader.Close()
 
+	if len(reader.File) > appUpdateMaxZipFiles {
+		return fmt.Errorf("更新包内文件数量过多（%d），已拒绝解压", len(reader.File))
+	}
+
 	cleanDest := filepath.Clean(destDir)
+	var totalWritten int64
 	for _, file := range reader.File {
 		normalizedName := strings.ReplaceAll(file.Name, "\\", "/")
 		isDir := file.FileInfo().IsDir() || strings.HasSuffix(normalizedName, "/")
@@ -355,12 +372,27 @@ func extractZipArchive(zipPath, destDir string) error {
 			_ = src.Close()
 			return err
 		}
-		_, copyErr := io.Copy(dst, src)
+		remaining := appUpdateMaxTotalBytes - totalWritten
+		if remaining <= 0 {
+			_ = src.Close()
+			_ = dst.Close()
+			return errors.New("更新包解压总大小超过安全限制")
+		}
+		limit := int64(appUpdateMaxFileBytes)
+		if remaining < limit {
+			limit = remaining
+		}
+		written, copyErr := io.Copy(dst, io.LimitReader(src, limit+1))
 		_ = src.Close()
 		_ = dst.Close()
 		if copyErr != nil {
 			return copyErr
 		}
+		if written > limit {
+			_ = os.Remove(path)
+			return errors.New("更新包内文件解压大小超过安全限制")
+		}
+		totalWritten += written
 	}
 	return nil
 }
@@ -424,6 +456,32 @@ func performAtomicInPlaceUpdate(extractedAppDir, exePath string) error {
 		_ = os.Rename(oldExe, exePath)
 		return fmt.Errorf("复制新主程序失败：%w", err)
 	}
+
+	appRoot := filepath.Dir(exePath)
+	stagingTools := filepath.Join(extractedAppDir, "tools")
+	if info, err := os.Stat(stagingTools); err == nil && info.IsDir() {
+		dstTools := filepath.Join(appRoot, "tools")
+		_ = filepath.WalkDir(stagingTools, func(srcPath string, d os.DirEntry, walkErr error) error {
+			if walkErr != nil {
+				return nil
+			}
+			rel, err := filepath.Rel(stagingTools, srcPath)
+			if err != nil || rel == "." {
+				return nil
+			}
+			dstPath := filepath.Join(dstTools, rel)
+			if d.IsDir() {
+				_ = os.MkdirAll(dstPath, 0o755)
+				return nil
+			}
+			_ = os.MkdirAll(filepath.Dir(dstPath), 0o755)
+			dstOld := dstPath + ".old"
+			_ = os.Remove(dstOld)
+			_ = os.Rename(dstPath, dstOld)
+			_ = copyUpdateFile(srcPath, dstPath)
+			return nil
+		})
+	}
 	return nil
 }
 
@@ -443,6 +501,13 @@ func updateStagingRoot() string {
 func cleanupOldUpdateArtifacts() {
 	if exePath, err := os.Executable(); err == nil && exePath != "" {
 		_ = os.Remove(exePath + ".old")
+		toolsDir := filepath.Join(filepath.Dir(exePath), "tools")
+		_ = filepath.WalkDir(toolsDir, func(path string, d os.DirEntry, err error) error {
+			if err == nil && !d.IsDir() && strings.HasSuffix(d.Name(), ".old") {
+				_ = os.Remove(path)
+			}
+			return nil
+		})
 	}
 
 	updatesDir := updateStagingRoot()
@@ -462,12 +527,15 @@ func cleanupOldUpdateArtifacts() {
 }
 
 func (a *App) emitUpdateProgress(progress AppUpdateProgress) {
-	if a.ctx != nil {
-		runtime.EventsEmit(a.ctx, "app-update-progress", progress)
+	if ctx, err := a.runtimeContext(); err == nil {
+		runtime.EventsEmit(ctx, "app-update-progress", progress)
 	}
 }
 
 func (a *App) CheckAppUpdate() (*AppUpdateInfo, error) {
+	if err := a.requireUnlocked(); err != nil {
+		return nil, err
+	}
 	if a.updateManager == nil {
 		a.updateManager = newAppUpdateManager()
 	}
@@ -475,6 +543,9 @@ func (a *App) CheckAppUpdate() (*AppUpdateInfo, error) {
 }
 
 func (a *App) ApplyAppUpdate() error {
+	if err := a.requireUnlocked(); err != nil {
+		return err
+	}
 	if a.updateManager == nil {
 		a.updateManager = newAppUpdateManager()
 	}
@@ -517,7 +588,7 @@ func (a *App) ApplyAppUpdate() error {
 			_ = os.Remove(zipPath)
 		}
 	}
-	_ = os.WriteFile(targetVerFile, []byte(info.LatestVersion), 0o644)
+	_ = os.WriteFile(targetVerFile, []byte(info.LatestVersion), 0o600)
 
 	if isValidUpdateZip(zipPath, info.AssetSize) {
 		a.emitUpdateProgress(AppUpdateProgress{
@@ -596,8 +667,8 @@ func (a *App) ApplyAppUpdate() error {
 
 	go func() {
 		time.Sleep(450 * time.Millisecond)
-		if a.ctx != nil {
-			runtime.Quit(a.ctx)
+		if ctx, err := a.runtimeContext(); err == nil {
+			runtime.Quit(ctx)
 		}
 	}()
 	return nil

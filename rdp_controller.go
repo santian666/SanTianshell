@@ -364,8 +364,8 @@ func (a *App) OpenRDP(id string) (string, error) {
 	emitStatus := func(event rdp.StatusEvent) {
 		event = a.rdpStatusForUI(event)
 		slog.Info("RDP 会话状态", "主机ID", id, "会话ID", event.SessionID, "状态", event.State, "PID", event.PID, "错误", event.Error)
-		if a.ctx != nil {
-			runtime2.EventsEmit(a.ctx, "rdp-status", map[string]any{
+		if ctx, err := a.runtimeContext(); err == nil {
+			runtime2.EventsEmit(ctx, "rdp-status", map[string]any{
 				"hostId": id, "sessionId": event.SessionID, "state": event.State,
 				"pid": event.PID, "error": event.Error,
 			})

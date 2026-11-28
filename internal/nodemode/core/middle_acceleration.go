@@ -84,10 +84,13 @@ func (s *Service) RunMiddleAcceleration(req MiddleAccelerationRequest) (MiddleAc
 func (s *Service) RunMiddleAccelerationWithLogger(req MiddleAccelerationRequest, emit func(string)) (MiddleAccelerationResult, error) {
 	result := MiddleAccelerationResult{Logs: []string{}}
 	var logMu sync.Mutex
+	const maxMiddleAccelerationLogs = 2000
 	logf := func(format string, args ...interface{}) {
 		line := time.Now().Format("15:04:05") + " " + fmt.Sprintf(format, args...)
 		logMu.Lock()
-		result.Logs = append(result.Logs, line)
+		if len(result.Logs) < maxMiddleAccelerationLogs {
+			result.Logs = append(result.Logs, line)
+		}
 		logMu.Unlock()
 		if emit != nil {
 			emit(line)
@@ -746,7 +749,14 @@ func (c *yixunClient) do(method, path string, body interface{}, out interface{})
 		return err
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("HTTP %d：%s", resp.StatusCode, strings.TrimSpace(string(data)))
+		msg := strings.TrimSpace(string(data))
+		if c.token != "" {
+			msg = strings.ReplaceAll(msg, c.token, "[REDACTED]")
+		}
+		if len(msg) > 300 {
+			msg = msg[:300] + "..."
+		}
+		return fmt.Errorf("HTTP %d：%s", resp.StatusCode, msg)
 	}
 	if err := json.Unmarshal(data, out); err != nil {
 		return fmt.Errorf("返回数据解析失败：%v", err)

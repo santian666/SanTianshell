@@ -36,7 +36,7 @@ import (
 	"golang.org/x/sys/windows/registry"
 )
 
-const appVersion = "0.1.36"
+const appVersion = "0.1.37"
 
 const (
 	maxAIModelsResponseSize  = 2 << 20
@@ -301,7 +301,9 @@ func NewApp() (*App, error) {
 	return a, nil
 }
 func (a *App) startup(ctx context.Context) {
+	a.mu.Lock()
 	a.ctx = ctx
+	a.mu.Unlock()
 	go cleanupOldUpdateArtifacts()
 }
 
@@ -768,10 +770,13 @@ func defaultDownloadDirectory() string {
 }
 func logDirectory() string { return filepath.Join(appDataPath(), "logs") }
 func (a *App) runtimeContext() (context.Context, error) {
-	if a.ctx == nil {
+	a.mu.RLock()
+	ctx := a.ctx
+	a.mu.RUnlock()
+	if ctx == nil {
 		return nil, errors.New("应用窗口尚未初始化")
 	}
-	return a.ctx, nil
+	return ctx, nil
 }
 func (a *App) SelectDownloadDirectory() (string, error) {
 	if err := a.requireUnlocked(); err != nil {
@@ -790,7 +795,16 @@ func (a *App) SelectDownloadDirectory() (string, error) {
 	return runtime2.OpenDirectoryDialog(ctx, runtime2.OpenDialogOptions{Title: "选择下载保存文件夹", DefaultDirectory: dir})
 }
 func (a *App) GetAppInfo() AppInfo {
-	return AppInfo{Name: "SanTianShell", Version: appVersion, Platform: goruntime.GOOS, Arch: goruntime.GOARCH, GoVersion: goruntime.Version(), DataDir: appDataPath(), LogDir: logDirectory(), Framework: "Go + Wails 2 + Vite + 原生 JavaScript/CSS"}
+	a.mu.RLock()
+	unlocked := a.unlocked
+	a.mu.RUnlock()
+	dataDir := ""
+	logDir := ""
+	if unlocked {
+		dataDir = appDataPath()
+		logDir = logDirectory()
+	}
+	return AppInfo{Name: "SanTianShell", Version: appVersion, Platform: goruntime.GOOS, Arch: goruntime.GOARCH, GoVersion: goruntime.Version(), DataDir: dataDir, LogDir: logDir, Framework: "Go + Wails 2 + Vite + 原生 JavaScript/CSS"}
 }
 func (a *App) OpenLogDirectory() error {
 	if err := a.requireUnlocked(); err != nil {

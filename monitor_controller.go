@@ -580,10 +580,11 @@ func (a *App) StartMonitorStream(id string, clientEpoch int) error {
 		monitorStreamCommand,
 		func(frame string) {
 			cur, curErr := a.connectedShell(id, clientEpoch)
-			if curErr != nil || cur != shell || a.ctx == nil {
+			ctx, ctxErr := a.runtimeContext()
+			if curErr != nil || cur != shell || ctxErr != nil {
 				return
 			}
-			runtime2.EventsEmit(a.ctx, "ssh-monitor-stream", map[string]any{
+			runtime2.EventsEmit(ctx, "ssh-monitor-stream", map[string]any{
 				"id":     id,
 				"epoch":  clientEpoch,
 				"output": frame,
@@ -595,10 +596,11 @@ func (a *App) StartMonitorStream(id string, clientEpoch int) error {
 				return
 			}
 			cur, curErr := a.connectedShell(id, clientEpoch)
-			if curErr != nil || cur != shell || a.ctx == nil {
+			ctx, ctxErr := a.runtimeContext()
+			if curErr != nil || cur != shell || ctxErr != nil {
 				return
 			}
-			runtime2.EventsEmit(a.ctx, "ssh-monitor-stream-stopped", map[string]any{
+			runtime2.EventsEmit(ctx, "ssh-monitor-stream-stopped", map[string]any{
 				"id":    id,
 				"epoch": clientEpoch,
 				"error": exitErr.Error(),
@@ -616,14 +618,15 @@ func (a *App) StartMonitorStream(id string, clientEpoch int) error {
 				return
 			}
 			latency, latErr := shell.SSHLatency(3 * time.Second)
-			if rttCtx.Err() != nil || a.ctx == nil {
+			ctx, ctxErr := a.runtimeContext()
+			if rttCtx.Err() != nil || ctxErr != nil {
 				return
 			}
 			cur, curErr = a.connectedShell(id, clientEpoch)
 			if curErr != nil || cur != shell {
 				return
 			}
-			runtime2.EventsEmit(a.ctx, "ssh-monitor-latency", map[string]any{
+			runtime2.EventsEmit(ctx, "ssh-monitor-latency", map[string]any{
 				"id":      id,
 				"epoch":   clientEpoch,
 				"latency": latency,
@@ -647,6 +650,9 @@ func (a *App) StartMonitorStream(id string, clientEpoch int) error {
 }
 
 func (a *App) StopMonitorStream(id string) {
+	if a.requireUnlocked() != nil {
+		return
+	}
 	id = strings.TrimSpace(id)
 	if id == "" {
 		a.stopMonitorStreamsExcept("")

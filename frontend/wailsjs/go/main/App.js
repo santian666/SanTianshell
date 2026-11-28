@@ -38,12 +38,12 @@ export function CheckHostSingboxStatus(arg1) {
   return window['go']['main']['App']['CheckHostSingboxStatus'](arg1);
 }
 
-export function ClearAIAgentChat(arg1) {
-  return window['go']['main']['App']['ClearAIAgentChat'](arg1);
-}
-
 export function ChmodRemotePath(arg1, arg2, arg3, arg4) {
   return window['go']['main']['App']['ChmodRemotePath'](arg1, arg2, arg3, arg4);
+}
+
+export function ClearAIAgentChat(arg1) {
+  return window['go']['main']['App']['ClearAIAgentChat'](arg1);
 }
 
 export function CloseRDP(arg1) {

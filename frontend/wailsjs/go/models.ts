@@ -1115,6 +1115,36 @@ export namespace main {
 	        this.framework = source["framework"];
 	    }
 	}
+	export class AppUpdateInfo {
+	    available: boolean;
+	    currentVersion: string;
+	    latestVersion: string;
+	    releaseNotes: string;
+	    downloadUrl: string;
+	    assetName?: string;
+	    assetSize: number;
+	    publishedAt: string;
+	    status: string;
+	    message?: string;
+	
+	    static createFrom(source: any = {}) {
+	        return new AppUpdateInfo(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.available = source["available"];
+	        this.currentVersion = source["currentVersion"];
+	        this.latestVersion = source["latestVersion"];
+	        this.releaseNotes = source["releaseNotes"];
+	        this.downloadUrl = source["downloadUrl"];
+	        this.assetName = source["assetName"];
+	        this.assetSize = source["assetSize"];
+	        this.publishedAt = source["publishedAt"];
+	        this.status = source["status"];
+	        this.message = source["message"];
+	    }
+	}
 	export class Credential {
 	    id: string;
 	    name: string;

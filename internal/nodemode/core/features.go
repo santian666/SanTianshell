@@ -144,15 +144,40 @@ type OutboundIPResult struct {
 	Message    string `json:"message"`
 }
 
+const dbSecretPrefix = "DPAPI:"
+
+func protectDBSecret(plain string) string {
+	if plain == "" || strings.HasPrefix(plain, dbSecretPrefix) {
+		return plain
+	}
+	sealed, err := protectMiddleSettings([]byte(plain))
+	if err != nil || len(sealed) == 0 {
+		return plain
+	}
+	return dbSecretPrefix + base64.StdEncoding.EncodeToString(sealed)
+}
+
+func unprotectDBSecret(stored string) string {
+	if !strings.HasPrefix(stored, dbSecretPrefix) {
+		return stored
+	}
+	raw, err := base64.StdEncoding.DecodeString(strings.TrimPrefix(stored, dbSecretPrefix))
+	if err != nil {
+		return stored
+	}
+	plain, err := unprotectMiddleSettings(raw)
+	if err != nil {
+		return stored
+	}
+	return string(plain)
+}
+
 func (s *Service) GetAutoDeleteSettings() (AutoDeleteSettings, error) {
-	db, err := s.openDB()
+	db, release, err := s.acquireDB()
 	if err != nil {
 		return AutoDeleteSettings{}, err
 	}
-	defer db.Close()
-	if err := ensureFeatureTables(db); err != nil {
-		return AutoDeleteSettings{}, err
-	}
+	defer release()
 	settings := defaultAutoDeleteSettings()
 	var data string
 	err = db.QueryRow(`select value from app_settings where key='auto_delete'`).Scan(&data)
@@ -169,14 +194,11 @@ func (s *Service) GetAutoDeleteSettings() (AutoDeleteSettings, error) {
 
 func (s *Service) SaveAutoDeleteSettings(settings AutoDeleteSettings) (AutoDeleteSettings, error) {
 	normalizeAutoDeleteSettings(&settings)
-	db, err := s.openDB()
+	db, release, err := s.acquireDB()
 	if err != nil {
 		return settings, err
 	}
-	defer db.Close()
-	if err := ensureFeatureTables(db); err != nil {
-		return settings, err
-	}
+	defer release()
 	data, _ := json.Marshal(settings)
 	_, err = db.Exec(`insert into app_settings(key,value,updated_at) values('auto_delete',?,?)
 		on conflict(key) do update set value=excluded.value,updated_at=excluded.updated_at`, string(data), nowText())
@@ -205,14 +227,11 @@ func (s *Service) runAutoDeleteCheck(vpsAlias string, scheduled bool) (AutoDelet
 	if err != nil {
 		return AutoDeleteRunResult{}, err
 	}
-	db, err := s.openDB()
+	db, release, err := s.acquireDB()
 	if err != nil {
 		return AutoDeleteRunResult{}, err
 	}
-	defer db.Close()
-	if err := ensureFeatureTables(db); err != nil {
-		return AutoDeleteRunResult{}, err
-	}
+	defer release()
 	now := nowText()
 	failedItems := []HealthStatus{}
 	deleteByAlias := map[string][]string{}
@@ -239,6 +258,18 @@ func (s *Service) runAutoDeleteCheck(vpsAlias string, scheduled bool) (AutoDelet
 	}
 	close(jobs)
 	checkWG.Wait()
+	tx, txErr := db.Begin()
+	if txErr != nil {
+		return AutoDeleteRunResult{}, txErr
+	}
+	upsertStmt, prepErr := tx.Prepare(`insert into health_status(vps_alias,vps_ip,node_group,node_tag,filename,inbound_port,fail_count,last_status,last_message,last_checked_at)
+			values(?,?,?,?,?,?,?,?,?,?)
+			on conflict(vps_alias,filename) do update set vps_ip=excluded.vps_ip,node_group=excluded.node_group,node_tag=excluded.node_tag,
+			inbound_port=excluded.inbound_port,fail_count=excluded.fail_count,last_status=excluded.last_status,last_message=excluded.last_message,last_checked_at=excluded.last_checked_at`)
+	if prepErr != nil {
+		_ = tx.Rollback()
+		return AutoDeleteRunResult{}, prepErr
+	}
 	for index, node := range nodes {
 		status := "ok"
 		message := "正常"
@@ -252,13 +283,10 @@ func (s *Service) runAutoDeleteCheck(vpsAlias string, scheduled bool) (AutoDelet
 		vps, _ := s.getVPS(node.VPSAlias)
 		if status == "failed" {
 			var oldCount int
-			_ = db.QueryRow(`select coalesce(fail_count,0) from health_status where vps_alias=? and filename=?`, node.VPSAlias, node.FileName).Scan(&oldCount)
+			_ = tx.QueryRow(`select coalesce(fail_count,0) from health_status where vps_alias=? and filename=?`, node.VPSAlias, node.FileName).Scan(&oldCount)
 			failCount += oldCount
 		}
-		_, _ = db.Exec(`insert into health_status(vps_alias,vps_ip,node_group,node_tag,filename,inbound_port,fail_count,last_status,last_message,last_checked_at)
-			values(?,?,?,?,?,?,?,?,?,?)
-			on conflict(vps_alias,filename) do update set vps_ip=excluded.vps_ip,node_group=excluded.node_group,node_tag=excluded.node_tag,
-			inbound_port=excluded.inbound_port,fail_count=excluded.fail_count,last_status=excluded.last_status,last_message=excluded.last_message,last_checked_at=excluded.last_checked_at`,
+		_, _ = upsertStmt.Exec(
 			node.VPSAlias, vps.Address, groupFromTag(node.Tag), node.Tag, node.FileName, node.ListenPort, failCount, status, message, now)
 		if status == "failed" {
 			item := HealthStatus{VPSAlias: node.VPSAlias, VPSIP: vps.Address, NodeGroup: groupFromTag(node.Tag), NodeTag: node.Tag, Filename: node.FileName, InboundPort: node.ListenPort, FailCount: failCount, LastStatus: status, LastMessage: message, LastCheckedAt: now}
@@ -268,14 +296,22 @@ func (s *Service) runAutoDeleteCheck(vpsAlias string, scheduled bool) (AutoDelet
 			}
 		}
 	}
+	_ = upsertStmt.Close()
+	if err := tx.Commit(); err != nil {
+		return AutoDeleteRunResult{}, err
+	}
 	for alias, filenames := range deleteByAlias {
 		count, err := s.moveNodesToDeletedRecords(alias, filenames)
 		if err != nil {
 			return AutoDeleteRunResult{}, err
 		}
 		deleted += count
-		for _, filename := range filenames {
-			_, _ = db.Exec(`delete from health_status where vps_alias=? and filename=?`, alias, filename)
+		delTx, delErr := db.Begin()
+		if delErr == nil {
+			for _, filename := range filenames {
+				_, _ = delTx.Exec(`delete from health_status where vps_alias=? and filename=?`, alias, filename)
+			}
+			_ = delTx.Commit()
 		}
 	}
 	message := fmt.Sprintf("检测完成：检查 %d 个，失败 %d 个，转入删除记录 %d 个。本次只修改本地配置，未改动远端服务器", len(nodes), len(failedItems), deleted)
@@ -311,7 +347,9 @@ func (s *Service) moveNodesToDeletedRecords(alias string, filenames []string) (i
 }
 
 func (s *Service) StartAutoDeleteScheduler(ctx context.Context) {
-	go s.autoDeleteScheduler(ctx)
+	s.autoDeleteSchedulerOnce.Do(func() {
+		go s.autoDeleteScheduler(ctx)
+	})
 }
 
 func (s *Service) autoDeleteScheduler(ctx context.Context) {
@@ -361,14 +399,11 @@ func (s *Service) autoDeleteScheduler(ctx context.Context) {
 }
 
 func (s *Service) GetHealthStatus() ([]HealthStatus, error) {
-	db, err := s.openDB()
+	db, release, err := s.acquireDB()
 	if err != nil {
 		return nil, err
 	}
-	defer db.Close()
-	if err := ensureFeatureTables(db); err != nil {
-		return nil, err
-	}
+	defer release()
 	rows, err := db.Query(`select id,coalesce(vps_alias,''),coalesce(vps_ip,''),coalesce(node_group,''),coalesce(node_tag,''),coalesce(filename,''),coalesce(inbound_port,0),coalesce(fail_count,0),coalesce(last_status,''),coalesce(last_message,''),coalesce(last_checked_at,'') from health_status order by last_checked_at desc,id desc limit 1000`)
 	if err != nil {
 		return nil, err
@@ -392,11 +427,11 @@ func (s *Service) ClearHealthStatus(confirmText string) (int, error) {
 	if strings.TrimSpace(confirmText) != "确认清空" {
 		return 0, errors.New("请输入：确认清空")
 	}
-	db, err := s.openDB()
+	db, release, err := s.acquireDB()
 	if err != nil {
 		return 0, err
 	}
-	defer db.Close()
+	defer release()
 	result, err := db.Exec(`delete from health_status`)
 	if err != nil {
 		return 0, err
@@ -409,11 +444,11 @@ func (s *Service) DeleteDeletedRecords(ids []int, confirmText string) (Operation
 	if strings.TrimSpace(confirmText) != "确认删除" {
 		return OperationResult{Success: false, Message: "请输入：确认删除"}, nil
 	}
-	db, err := s.openDB()
+	db, release, err := s.acquireDB()
 	if err != nil {
 		return OperationResult{}, err
 	}
-	defer db.Close()
+	defer release()
 	tx, err := db.Begin()
 	if err != nil {
 		return OperationResult{}, err
@@ -439,15 +474,24 @@ func (s *Service) RestoreDeletedRecords(ids []int) (OperationResult, error) {
 	return s.restoreDeletedRecordsBatch(ids)
 }
 func (s *Service) ImportNodeConnections(text string) (ImportResult, error) {
-	db, err := s.openDB()
+	db, release, err := s.acquireDB()
 	if err != nil {
 		return ImportResult{}, err
 	}
-	defer db.Close()
-	if err := ensureFeatureTables(db); err != nil {
+	defer release()
+	tx, err := db.Begin()
+	if err != nil {
 		return ImportResult{}, err
 	}
+	insertStmt, err := tx.Prepare(`insert or ignore into node_connection_records(ip,port,username,password,renewal_date,remark,country,connection_str,created_at) values(?,?,?,?,?,?,?,?,?)`)
+	if err != nil {
+		_ = tx.Rollback()
+		return ImportResult{}, err
+	}
+	defer insertStmt.Close()
+
 	result := ImportResult{Success: true}
+	now := nowText()
 	for lineNo, line := range strings.Split(text, "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" {
@@ -459,14 +503,32 @@ func (s *Service) ImportNodeConnections(text string) (ImportResult, error) {
 			result.Errors = append(result.Errors, fmt.Sprintf("第 %d 行格式错误", lineNo+1))
 			continue
 		}
-		_, err := db.Exec(`insert or ignore into node_connection_records(ip,port,username,password,renewal_date,remark,country,connection_str,created_at) values(?,?,?,?,?,?,?,?,?)`,
-			item.IP, item.Port, item.Username, item.Password, item.RenewalDate, item.Remark, item.Country, item.ConnectionStr, nowText())
+		exists := false
+		if rows, qErr := tx.Query(`select coalesce(password,'') from node_connection_records where ip=? and port=? and coalesce(username,'')=?`, item.IP, item.Port, item.Username); qErr == nil {
+			for rows.Next() {
+				var storedPass string
+				if rows.Scan(&storedPass) == nil && unprotectDBSecret(storedPass) == item.Password {
+					exists = true
+					break
+				}
+			}
+			_ = rows.Close()
+		}
+		if exists {
+			result.Skipped++
+			continue
+		}
+		_, err := insertStmt.Exec(
+			item.IP, item.Port, item.Username, protectDBSecret(item.Password), item.RenewalDate, item.Remark, item.Country, protectDBSecret(item.ConnectionStr), now)
 		if err != nil {
 			result.Skipped++
 			result.Errors = append(result.Errors, err.Error())
 			continue
 		}
 		result.Imported++
+	}
+	if err := tx.Commit(); err != nil {
+		return ImportResult{}, err
 	}
 	result.Message = fmt.Sprintf("导入完成：成功 %d，跳过 %d", result.Imported, result.Skipped)
 	return result, nil
@@ -476,23 +538,25 @@ func (s *Service) SearchNodeConnections(keyword string, limit int) ([]NodeConnec
 	if limit <= 0 || limit > 1000 {
 		limit = 200
 	}
-	db, err := s.openDB()
+	return s.queryNodeConnections(keyword, limit)
+}
+
+func (s *Service) queryNodeConnections(keyword string, limit int) ([]NodeConnectionRecord, error) {
+	if limit <= 0 {
+		limit = 200
+	}
+	db, release, err := s.acquireDB()
 	if err != nil {
 		return nil, err
 	}
-	defer db.Close()
-	if err := ensureFeatureTables(db); err != nil {
-		return nil, err
+	defer release()
+	kw := strings.ToLower(strings.TrimSpace(keyword))
+	var rows *sql.Rows
+	if kw == "" {
+		rows, err = db.Query(`select id,ip,port,coalesce(username,''),coalesce(password,''),coalesce(renewal_date,''),coalesce(remark,''),coalesce(country,''),coalesce(connection_str,''),coalesce(created_at,'') from node_connection_records order by id desc limit ?`, limit)
+	} else {
+		rows, err = db.Query(`select id,ip,port,coalesce(username,''),coalesce(password,''),coalesce(renewal_date,''),coalesce(remark,''),coalesce(country,''),coalesce(connection_str,''),coalesce(created_at,'') from node_connection_records order by id desc`)
 	}
-	args := []any{}
-	where := ""
-	if strings.TrimSpace(keyword) != "" {
-		like := "%" + strings.TrimSpace(keyword) + "%"
-		where = ` where ip like ? or country like ? or remark like ? or connection_str like ?`
-		args = append(args, like, like, like, like)
-	}
-	args = append(args, limit)
-	rows, err := db.Query(`select id,ip,port,coalesce(username,''),coalesce(password,''),coalesce(renewal_date,''),coalesce(remark,''),coalesce(country,''),coalesce(connection_str,''),coalesce(created_at,'') from node_connection_records`+where+` order by id desc limit ?`, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -503,7 +567,20 @@ func (s *Service) SearchNodeConnections(keyword string, limit int) ([]NodeConnec
 		if err := rows.Scan(&item.ID, &item.IP, &item.Port, &item.Username, &item.Password, &item.RenewalDate, &item.Remark, &item.Country, &item.ConnectionStr, &item.CreatedAt); err != nil {
 			return nil, err
 		}
+		item.Password = unprotectDBSecret(item.Password)
+		item.ConnectionStr = unprotectDBSecret(item.ConnectionStr)
+		if kw != "" {
+			if !strings.Contains(strings.ToLower(item.IP), kw) &&
+				!strings.Contains(strings.ToLower(item.Country), kw) &&
+				!strings.Contains(strings.ToLower(item.Remark), kw) &&
+				!strings.Contains(strings.ToLower(item.ConnectionStr), kw) {
+				continue
+			}
+		}
 		items = append(items, item)
+		if len(items) >= limit {
+			break
+		}
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
@@ -512,11 +589,11 @@ func (s *Service) SearchNodeConnections(keyword string, limit int) ([]NodeConnec
 }
 
 func (s *Service) DeleteNodeConnection(id int) error {
-	db, err := s.openDB()
+	db, release, err := s.acquireDB()
 	if err != nil {
 		return err
 	}
-	defer db.Close()
+	defer release()
 	_, err = db.Exec(`delete from node_connection_records where id=?`, id)
 	return err
 }
@@ -525,11 +602,11 @@ func (s *Service) ClearNodeConnections(confirmText string) (int, error) {
 	if strings.TrimSpace(confirmText) != "确认清空" {
 		return 0, errors.New("请输入：确认清空")
 	}
-	db, err := s.openDB()
+	db, release, err := s.acquireDB()
 	if err != nil {
 		return 0, err
 	}
-	defer db.Close()
+	defer release()
 	result, err := db.Exec(`delete from node_connection_records`)
 	if err != nil {
 		return 0, err
@@ -539,7 +616,7 @@ func (s *Service) ClearNodeConnections(confirmText string) (int, error) {
 }
 
 func (s *Service) ExportNodeConnections(keyword string) (string, error) {
-	items, err := s.SearchNodeConnections(keyword, 100000)
+	items, err := s.queryNodeConnections(keyword, 100000)
 	if err != nil {
 		return "", err
 	}
@@ -554,14 +631,11 @@ func (s *Service) ExportNodeConnections(keyword string) (string, error) {
 }
 
 func (s *Service) GetRuleGroups() ([]RuleGroup, error) {
-	db, err := s.openDB()
+	db, release, err := s.acquireDB()
 	if err != nil {
 		return nil, err
 	}
-	defer db.Close()
-	if err := ensureFeatureTables(db); err != nil {
-		return nil, err
-	}
+	defer release()
 	rows, err := db.Query(`select id,name,coalesce(description,''),coalesce(rules,'[]'),coalesce(builtin,0),coalesce(created_at,''),coalesce(updated_at,'') from route_rule_groups order by builtin desc,name asc`)
 	if err != nil {
 		return nil, err
@@ -594,14 +668,11 @@ func (s *Service) SaveRuleGroup(group RuleGroup) error {
 	if len(group.Rules) == 0 {
 		return errors.New("规则不能为空")
 	}
-	db, err := s.openDB()
+	db, release, err := s.acquireDB()
 	if err != nil {
 		return err
 	}
-	defer db.Close()
-	if err := ensureFeatureTables(db); err != nil {
-		return err
-	}
+	defer release()
 	data, _ := json.Marshal(group.Rules)
 	_, err = db.Exec(`insert into route_rule_groups(name,description,rules,builtin,created_at,updated_at) values(?,?,?,?,?,?)
 		on conflict(name) do update set description=excluded.description,rules=excluded.rules,updated_at=excluded.updated_at`,
@@ -611,11 +682,11 @@ func (s *Service) SaveRuleGroup(group RuleGroup) error {
 
 func (s *Service) DeleteRuleGroup(name string) error {
 	name = strings.TrimSpace(name)
-	db, err := s.openDB()
+	db, release, err := s.acquireDB()
 	if err != nil {
 		return err
 	}
-	defer db.Close()
+	defer release()
 	var builtin int
 	_ = db.QueryRow(`select coalesce(builtin,0) from route_rule_groups where name=?`, name).Scan(&builtin)
 	if builtin == 1 {
@@ -846,6 +917,7 @@ func ensureFeatureTables(db *sql.DB) error {
 		`create table if not exists route_rule_groups (id integer primary key autoincrement,name text not null unique,description text,rules text not null,builtin integer default 0,created_at timestamp default current_timestamp,updated_at timestamp default current_timestamp);`,
 		`create table if not exists node_rule_mappings (id integer primary key autoincrement,node_tag text not null,rule_group_name text not null,created_at timestamp default current_timestamp,unique(node_tag,rule_group_name));`,
 		`create index if not exists idx_health_status_vps on health_status(vps_alias);`,
+		`create index if not exists idx_health_status_checked on health_status(last_checked_at desc,id desc);`,
 		`create index if not exists idx_node_connection_search on node_connection_records(ip,country,remark);`,
 	}, "\n")
 	_, err := db.Exec(schema)
@@ -880,20 +952,44 @@ func parseNodeConnectionLine(line string) (NodeConnectionRecord, bool) {
 		return NodeConnectionRecord{}, false
 	}
 	conn := parts[0]
-	connParts := strings.Split(conn, ":")
-	if len(connParts) < 2 {
+	var host, portText, rest string
+	if strings.HasPrefix(conn, "[") {
+		closeIdx := strings.Index(conn, "]")
+		if closeIdx <= 1 || closeIdx+1 >= len(conn) || conn[closeIdx+1] != ':' {
+			return NodeConnectionRecord{}, false
+		}
+		host = conn[1:closeIdx]
+		afterHost := conn[closeIdx+2:]
+		colonIdx := strings.Index(afterHost, ":")
+		if colonIdx < 0 {
+			portText = afterHost
+		} else {
+			portText = afterHost[:colonIdx]
+			rest = afterHost[colonIdx+1:]
+		}
+	} else {
+		connParts := strings.SplitN(conn, ":", 3)
+		if len(connParts) < 2 {
+			return NodeConnectionRecord{}, false
+		}
+		host = connParts[0]
+		portText = connParts[1]
+		if len(connParts) == 3 {
+			rest = connParts[2]
+		}
+	}
+	host = strings.TrimSpace(host)
+	port, err := strconv.Atoi(strings.TrimSpace(portText))
+	if host == "" || err != nil || port <= 0 || port > 65535 {
 		return NodeConnectionRecord{}, false
 	}
-	port, err := strconv.Atoi(connParts[1])
-	if err != nil || port <= 0 {
-		return NodeConnectionRecord{}, false
-	}
-	item := NodeConnectionRecord{IP: connParts[0], Port: port, ConnectionStr: conn}
-	if len(connParts) > 2 {
-		item.Username = connParts[2]
-	}
-	if len(connParts) > 3 {
-		item.Password = connParts[3]
+	item := NodeConnectionRecord{IP: host, Port: port, ConnectionStr: conn}
+	if rest != "" {
+		userPass := strings.SplitN(rest, ":", 2)
+		item.Username = userPass[0]
+		if len(userPass) == 2 {
+			item.Password = userPass[1]
+		}
 	}
 	if len(parts) > 1 && isDate(parts[1]) {
 		item.RenewalDate = parts[1]

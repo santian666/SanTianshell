@@ -14,7 +14,7 @@
     !define INFO_PRODUCTNAME "SanTianShell"
 !endif
 !ifndef INFO_PRODUCTVERSION
-    !define INFO_PRODUCTVERSION "0.1.35"
+    !define INFO_PRODUCTVERSION "0.1.37"
 !endif
 !ifndef INFO_COPYRIGHT
     !define INFO_COPYRIGHT "Copyright SanTianShell"

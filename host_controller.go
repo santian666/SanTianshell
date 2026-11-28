@@ -500,6 +500,9 @@ func (a *App) DeleteHost(id string) (Settings, error) {
 }
 
 func (a *App) DeleteHosts(ids []string) (Settings, error) {
+	if err := a.requireUnlocked(); err != nil {
+		return Settings{}, err
+	}
 	seen := make(map[string]bool, len(ids))
 	var settings Settings
 	deleted := 0

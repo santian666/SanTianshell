@@ -60,7 +60,10 @@ func main() {
 				slog.Error("启动时清理失效的本地节点展示失败", "错误", err)
 			}
 			nodemode.Startup(nodeMode, ctx)
-		}, OnShutdown: app.shutdown,
+		}, OnShutdown: func(ctx context.Context) {
+			app.shutdown(ctx)
+			_ = nodemode.Close(nodeMode)
+		},
 	}); err != nil {
 		slog.Error("启动失败", "错误", err)
 	}
