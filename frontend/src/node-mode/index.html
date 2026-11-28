@@ -446,12 +446,13 @@
       <div class="modal-body compact-modal-body">
         <input id="modifyAlias" type="hidden" />
         <div class="form-section">
-          <div class="muted modal-help">每行一个，格式：ip:端口:用户名:新密码（按 IP 精确匹配，仅修改对应 IP 的落地节点）</div>
-          <textarea id="modifyOutboundLines" rows="8" placeholder="core-residential.evomi.com:1002:user:password"></textarea>
+          <div class="muted modal-help">每行一个，支持：<code>ip:端口:用户名:新密码</code>（按同 IP 匹配）或 <code>旧IP =&gt; 新IP:端口:用户名:密码</code>（跨 IP 替换），修改前自动备份。</div>
+          <textarea id="modifyOutboundLines" rows="8" placeholder="1.2.3.4:1080:user:newpass 或 1.1.1.1 => 2.2.2.2:1080:user:pass"></textarea>
           <div class="form-help-row" style="margin-top: 6px; display: flex; justify-content: space-between; align-items: center; font-size: var(--font-small, 12px);">
             <span class="muted" id="modifyLinesCount">已识别 0 条有效落地配置</span>
             <span class="muted" id="modifyLinesWarning" style="color: #e67e22;"></span>
           </div>
+          <pre class="rule-preview hidden" id="modifyPreviewBox" style="margin-top: 8px; max-height: 150px;"></pre>
         </div>
         <div class="node-progress hidden" id="modifyProgress">
           <div class="node-progress-result">
@@ -464,7 +465,7 @@
           <div class="node-progress-track"><div id="modifyProgressBar"></div></div>
         </div>
       </div>
-      <div class="modal-actions"><button class="btn secondary" id="cancelModifyModalBtn">取消</button><button class="btn primary" id="saveModifyBtn">保存修改</button></div>
+      <div class="modal-actions"><button class="btn secondary" id="cancelModifyModalBtn">取消</button><button class="btn secondary" id="previewModifyBtn" type="button">预览变更</button><button class="btn primary" id="saveModifyBtn">保存修改</button></div>
     </div>
   </div>
 
@@ -527,6 +528,8 @@
       </div>
       <div class="modal-actions detail-actions hidden" id="detailActions">
         <button class="btn secondary hidden" id="copyDetailJsonBtn">复制JSON</button>
+        <button class="btn secondary hidden" id="formatDetailJsonBtn" type="button">格式化</button>
+        <button class="btn secondary hidden" id="checkDetailJsonBtn" type="button">仅预检</button>
         <button class="btn warning hidden" id="editDetailJsonBtn">编辑</button>
         <button class="btn primary hidden" id="saveDetailJsonBtn">保存并部署</button>
         <button class="btn secondary" id="exportDetailLogBtn">导出日志</button>
@@ -669,6 +672,16 @@
                 <p>检测目标端口是否可连接。</p>
                 <button class="btn warning" id="debugPortBtn">检测端口</button>
               </div>
+              <div class="debug-card">
+                <h2>DNS 解析</h2>
+                <p>检查 VPS 当前 DNS 解析是否正常。</p>
+                <button class="btn secondary" id="debugDnsBtn">检测 DNS</button>
+              </div>
+              <div class="debug-card">
+                <h2>出口 IP 连通</h2>
+                <p>检测 IPv4/IPv6 出口与外网 HTTPS 延迟。</p>
+                <button class="btn secondary" id="debugExitIpBtn">检测出口</button>
+              </div>
             </div>
           </div>
           <div class="debug-form-card hidden" id="debugIperfPanel">
@@ -713,7 +726,15 @@
               <option value="1000">1000 行</option>
             </select>
           </label>
+          <label>级别
+            <select id="singboxLogLevel">
+              <option value="all" selected>全部级别</option>
+              <option value="warn">仅 ERROR/WARN</option>
+            </select>
+          </label>
           <button class="btn primary small" id="refreshSingboxLogBtn" type="button">刷新日志</button>
+          <label style="display:inline-flex;align-items:center;gap:4px;font-size:12px;"><input id="singboxLogAutoRefresh" type="checkbox" style="width:auto;" />实时(3s)</label>
+          <button class="btn warning small" id="diagnoseSingboxLogBtn" type="button">AI 诊断</button>
           <button class="btn secondary small" id="copySingboxLogBtn" type="button">复制日志</button>
           <button class="btn secondary small" id="clearSingboxLogBtn" type="button">清空显示</button>
           <span class="muted singbox-log-status" id="singboxLogStatus"></span>
@@ -764,6 +785,8 @@
             <button class="segment" type="button" data-limit="50">Top50</button>
           </div>
           <span class="muted" id="trafficStatus">等待采集</span>
+          <label style="display:inline-flex;align-items:center;gap:4px;font-size:12px;"><input id="trafficAutoRefresh" type="checkbox" style="width:auto;" />自动刷新(3s)</label>
+          <button class="btn secondary small" id="initTrafficCounterBtn" type="button">启用总流量统计</button>
         </div>
         <div class="debug-tabs traffic-tabs">
           <button class="debug-tab active" type="button">实时上下行</button>

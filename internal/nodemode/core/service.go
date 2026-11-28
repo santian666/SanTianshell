@@ -181,12 +181,16 @@ type CheckResult struct {
 }
 
 type VPSRuntimeState struct {
-	Alias     string `json:"alias"`
-	Status    string `json:"status"`
-	NodeCount int    `json:"nodeCount"`
-	StartPort int    `json:"startPort"`
-	Synced    bool   `json:"synced"`
-	Message   string `json:"message"`
+	Alias         string `json:"alias"`
+	Status        string `json:"status"`
+	NodeCount     int    `json:"nodeCount"`
+	StartPort     int    `json:"startPort"`
+	Synced        bool   `json:"synced"`
+	ConfigDiff    bool   `json:"configDiff,omitempty"`
+	CoreVersion   string `json:"coreVersion,omitempty"`
+	Uptime        string `json:"uptime,omitempty"`
+	ErrorCategory string `json:"errorCategory,omitempty"`
+	Message       string `json:"message"`
 }
 
 type IPInfo struct {

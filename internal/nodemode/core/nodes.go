@@ -32,6 +32,7 @@ type AddNodeRequest struct {
 	InboundProtocol  string          `json:"inboundProtocol"`
 	OutboundProtocol string          `json:"outboundProtocol"`
 	StartPort        int             `json:"startPort"`
+	RandomPort       bool            `json:"randomPort,omitempty"`
 	Count            int             `json:"count"`
 	TLSEnabled       bool            `json:"tlsEnabled"`
 	RealityEnabled   bool            `json:"realityEnabled"`
@@ -52,6 +53,7 @@ type BatchAddNodeRequest struct {
 	InboundProtocol  string                `json:"inboundProtocol"`
 	OutboundProtocol string                `json:"outboundProtocol"`
 	StartPort        int                   `json:"startPort"`
+	RandomPort       bool                  `json:"randomPort,omitempty"`
 	TLSEnabled       bool                  `json:"tlsEnabled"`
 	RealityEnabled   bool                  `json:"realityEnabled"`
 	RealitySNI       string                `json:"realitySni"`
@@ -63,6 +65,7 @@ type MultiIPNodeRequest struct {
 	GroupName       string   `json:"groupName"`
 	InboundProtocol string   `json:"inboundProtocol"`
 	StartPort       int      `json:"startPort"`
+	IncludeIPv6     bool     `json:"includeIpv6,omitempty"`
 	RealitySNI      string   `json:"realitySni"`
 	IPs             []string `json:"ips"`
 }
@@ -70,10 +73,39 @@ type MultiIPNodeRequest struct {
 type VPSIPList struct {
 	Alias            string   `json:"alias"`
 	IPs              []string `json:"ips"`
+	PrivateIPs       []string `json:"private_ips,omitempty"`
 	Count            int      `json:"count"`
 	TotalCount       int      `json:"total_count"`
 	CreatedIPCount   int      `json:"created_ip_count"`
 	DefaultStartPort int      `json:"default_start_port"`
+}
+
+type ModifyOutboundChange struct {
+	FileName    string `json:"fileName"`
+	Tag         string `json:"tag"`
+	Port        int    `json:"port"`
+	OldOutbound string `json:"oldOutbound"`
+	NewOutbound string `json:"newOutbound"`
+}
+
+type ModifyOutboundPreview struct {
+	Success   bool                   `json:"success"`
+	Message   string                 `json:"message"`
+	Changes   []ModifyOutboundChange `json:"changes"`
+	Unmatched []string               `json:"unmatched,omitempty"`
+}
+
+type BackupDiffPreview struct {
+	Success        bool     `json:"success"`
+	Message        string   `json:"message"`
+	SourceAlias    string   `json:"sourceAlias"`
+	TargetAlias    string   `json:"targetAlias"`
+	BackupCount    int      `json:"backupCount"`
+	CurrentCount   int      `json:"currentCount"`
+	Added          []string `json:"added"`
+	Removed        []string `json:"removed"`
+	Modified       []string `json:"modified"`
+	BindIPWarnings []string `json:"bindIpWarnings,omitempty"`
 }
 
 type NodeDefaults struct {
@@ -112,6 +144,51 @@ type OperationResult struct {
 	Items   []string `json:"items"`
 }
 
+func pickRandomFreePorts(configs map[string]map[string]any, count int) ([]int, error) {
+	used := map[int]bool{}
+	for _, cfg := range configs {
+		if p := extractListenPort(cfg); p > 0 {
+			used[p] = true
+		}
+	}
+	const minPort, maxPort = 20000, 60000
+	if count <= 0 || count > (maxPort-minPort+1)-len(used) {
+		return nil, errors.New("可用随机端口不足")
+	}
+	ports := make([]int, 0, count)
+	var b [2]byte
+	for len(ports) < count {
+		if _, err := rand.Read(b[:]); err != nil {
+			return nil, err
+		}
+		candidate := minPort + int(uint16(b[0])<<8|uint16(b[1]))%(maxPort-minPort+1)
+		if used[candidate] {
+			continue
+		}
+		used[candidate] = true
+		ports = append(ports, candidate)
+	}
+	return ports, nil
+}
+
+func deduplicateOutbounds(outbounds []map[string]any) []map[string]any {
+	if len(outbounds) <= 1 {
+		return outbounds
+	}
+	seen := make(map[string]bool, len(outbounds))
+	unique := make([]map[string]any, 0, len(outbounds))
+	for _, ob := range outbounds {
+		key, _ := json.Marshal(ob)
+		ks := string(key)
+		if seen[ks] {
+			continue
+		}
+		seen[ks] = true
+		unique = append(unique, ob)
+	}
+	return unique
+}
+
 func (s *Service) AddNodes(req AddNodeRequest) (OperationResult, error) {
 	req.VPSAlias = strings.TrimSpace(req.VPSAlias)
 	req.GroupName = strings.TrimSpace(req.GroupName)
@@ -138,16 +215,28 @@ func (s *Service) AddNodes(req AddNodeRequest) (OperationResult, error) {
 	if err != nil {
 		return OperationResult{}, err
 	}
-	if req.StartPort <= 0 {
-		req.StartPort = firstFreePort(configs, req.Count, 20000)
+	var assignedPorts []int
+	if req.RandomPort {
+		assignedPorts, err = pickRandomFreePorts(configs, req.Count)
+		if err != nil {
+			return OperationResult{Success: false, Message: err.Error()}, nil
+		}
+	} else {
+		if req.StartPort <= 0 {
+			req.StartPort = firstFreePort(configs, req.Count, 20000)
+		}
+		if req.StartPort <= 0 || req.StartPort > 65535 || req.StartPort+req.Count-1 > 65535 {
+			return OperationResult{Success: false, Message: "端口范围超出限制"}, nil
+		}
+		if conflicts := usedPortsInRange(configs, req.StartPort, req.Count); len(conflicts) > 0 {
+			return OperationResult{Success: false, Message: fmt.Sprintf("端口已被占用: %v", conflicts)}, nil
+		}
+		assignedPorts = make([]int, req.Count)
+		for i := 0; i < req.Count; i++ {
+			assignedPorts[i] = req.StartPort + i
+		}
 	}
-	if req.StartPort <= 0 || req.StartPort > 65535 || req.StartPort+req.Count-1 > 65535 {
-		return OperationResult{Success: false, Message: "端口范围超出限制"}, nil
-	}
-	if conflicts := usedPortsInRange(configs, req.StartPort, req.Count); len(conflicts) > 0 {
-		return OperationResult{Success: false, Message: fmt.Sprintf("端口已被占用: %v", conflicts)}, nil
-	}
-	outbounds := parseOutboundLines(req.OutboundLines, req.OutboundProtocol)
+	outbounds := deduplicateOutbounds(parseOutboundLines(req.OutboundLines, req.OutboundProtocol))
 	if len(outbounds) == 0 && req.OutboundDetails != nil {
 		outbounds = append(outbounds, req.OutboundDetails)
 	}
@@ -160,7 +249,7 @@ func (s *Service) AddNodes(req AddNodeRequest) (OperationResult, error) {
 	for i := 0; i < req.Count; i++ {
 		outbound := cloneMap(outbounds[i%len(outbounds)])
 		password := randomUUID()
-		port := req.StartPort + i
+		port := assignedPorts[i]
 		groupName := resolvedNodeGroupName(req.GroupName, outbound, fallbackName)
 		config := generateConfig(groupName, req.InboundProtocol, port, password, req.OutboundProtocol, outbound, req.TLSEnabled, req.RealityEnabled, req.RealitySNI)
 		tag := extractNodeTag(config)
@@ -262,7 +351,7 @@ func (s *Service) BatchAddNodes(req BatchAddNodeRequest) (OperationResult, error
 }
 
 func (s *Service) DetectVPSIPs(alias string) (VPSIPList, error) {
-	ips, err := s.detectVPSIPs(alias)
+	ips, err := s.detectVPSIPsWithOptions(alias, true)
 	if err != nil {
 		return VPSIPList{}, err
 	}
@@ -271,6 +360,12 @@ func (s *Service) DetectVPSIPs(alias string) (VPSIPList, error) {
 		return VPSIPList{}, err
 	}
 	available := uncreatedMultiIPs(ips, configs)
+	privateIPs := []string{}
+	for _, ipStr := range available {
+		if parsed := net.ParseIP(ipStr); parsed != nil && parsed.IsPrivate() {
+			privateIPs = append(privateIPs, ipStr)
+		}
+	}
 	createdCount := len(cleanMultiIPList(ips)) - len(available)
 	if createdCount < 0 {
 		createdCount = 0
@@ -279,7 +374,7 @@ func (s *Service) DetectVPSIPs(alias string) (VPSIPList, error) {
 	if start <= 0 {
 		start = nextStartPort(maxListenPort(configs), 20000)
 	}
-	return VPSIPList{Alias: alias, IPs: available, Count: len(available), TotalCount: len(cleanMultiIPList(ips)), CreatedIPCount: createdCount, DefaultStartPort: start}, nil
+	return VPSIPList{Alias: alias, IPs: available, PrivateIPs: privateIPs, Count: len(available), TotalCount: len(cleanMultiIPList(ips)), CreatedIPCount: createdCount, DefaultStartPort: start}, nil
 }
 
 func (s *Service) AddMultiIPNodes(req MultiIPNodeRequest) (OperationResult, error) {
@@ -299,7 +394,7 @@ func (s *Service) AddMultiIPNodes(req MultiIPNodeRequest) (OperationResult, erro
 	}
 	ips := cleanMultiIPList(req.IPs)
 	if len(ips) == 0 {
-		detectedIPs, err := s.detectVPSIPs(req.VPSAlias)
+		detectedIPs, err := s.detectVPSIPsWithOptions(req.VPSAlias, req.IncludeIPv6)
 		if err != nil {
 			return OperationResult{}, err
 		}
@@ -318,10 +413,15 @@ func (s *Service) AddMultiIPNodes(req MultiIPNodeRequest) (OperationResult, erro
 	if len(ips) == 0 {
 		return OperationResult{Success: false, Message: "没有检测到未创建协议的 IP"}, nil
 	}
+	explicitStartPort := req.StartPort > 0
 	if req.StartPort <= 0 {
 		req.StartPort = firstFreePort(configs, len(ips), 20000)
 	}
 	if conflicts := usedPortsInRange(configs, req.StartPort, len(ips)); len(conflicts) > 0 {
+		if explicitStartPort {
+			suggested := firstFreePort(configs, len(ips), 20000)
+			return OperationResult{Success: false, Message: fmt.Sprintf("起始端口 %d 存在冲突端口 %v，建议改用起始端口 %d", req.StartPort, conflicts, suggested)}, nil
+		}
 		req.StartPort = firstFreePort(configs, len(ips), 20000)
 	}
 	if req.StartPort <= 0 || req.StartPort > 65535 || req.StartPort+len(ips)-1 > 65535 {
@@ -451,13 +551,149 @@ func (s *Service) DeleteNodeGroup(alias string, group string) (OperationResult, 
 	return OperationResult{Success: true, Message: fmt.Sprintf("节点组 %s 已删除，共 %d 个节点", targetGroup, len(deleted)), Count: len(deleted), Items: deleted}, nil
 }
 
+type outboundMappingEntry struct {
+	MatchIP  string
+	Outbound map[string]any
+}
+
+func parseOutboundMappingLines(text string, protocol string) []outboundMappingEntry {
+	entries := []outboundMappingEntry{}
+	for _, rawLine := range strings.Split(strings.ReplaceAll(text, "\r\n", "\n"), "\n") {
+		line := strings.TrimSpace(rawLine)
+		if line == "" {
+			continue
+		}
+		matchIP := ""
+		outboundText := line
+		if idx := strings.Index(line, "=>"); idx > 0 {
+			matchIP = normalizeServerAddress(strings.TrimSpace(line[:idx]))
+			outboundText = strings.TrimSpace(line[idx+2:])
+		}
+		parsed := parseOutboundLines(outboundText, protocol)
+		for _, ob := range parsed {
+			targetMatch := matchIP
+			if targetMatch == "" {
+				targetMatch = normalizeServerAddress(asString(ob["server"]))
+			}
+			entries = append(entries, outboundMappingEntry{MatchIP: targetMatch, Outbound: ob})
+		}
+	}
+	return entries
+}
+
+func formatOutboundBrief(outbound map[string]any) string {
+	if outbound == nil {
+		return "-"
+	}
+	server := asString(outbound["server"])
+	port := asInt(outbound["server_port"])
+	user := asString(outbound["username"])
+	if server == "" {
+		return asString(outbound["type"])
+	}
+	if user != "" {
+		return fmt.Sprintf("%s:%d (%s)", server, port, user)
+	}
+	return fmt.Sprintf("%s:%d", server, port)
+}
+
+func (s *Service) PreviewModifyNodeOutbounds(alias string, filenames []string, outboundLines string, outboundProtocol string) (ModifyOutboundPreview, error) {
+	alias = strings.TrimSpace(alias)
+	if alias == "" {
+		return ModifyOutboundPreview{Success: false, Message: "VPS 不能为空"}, nil
+	}
+	entries := parseOutboundMappingLines(outboundLines, outboundProtocol)
+	if len(entries) == 0 {
+		return ModifyOutboundPreview{Success: false, Message: "落地代理为空或格式错误"}, nil
+	}
+	configs, err := s.loadNodeConfigMap(alias)
+	if err != nil {
+		return ModifyOutboundPreview{}, err
+	}
+	if len(configs) == 0 {
+		return ModifyOutboundPreview{Success: false, Message: "该 VPS 暂无可修改的节点"}, nil
+	}
+	target := map[string]bool{}
+	for _, fn := range filenames {
+		fn = strings.TrimSpace(fn)
+		if fn != "" {
+			target[fn] = true
+		}
+	}
+	changes := []ModifyOutboundChange{}
+	unmatched := []string{}
+	sortedFilenames := make([]string, 0, len(configs))
+	for fn := range configs {
+		if len(target) > 0 && !target[fn] {
+			continue
+		}
+		sortedFilenames = append(sortedFilenames, fn)
+	}
+	sort.Slice(sortedFilenames, func(i, j int) bool {
+		pi, pj := extractListenPort(configs[sortedFilenames[i]]), extractListenPort(configs[sortedFilenames[j]])
+		if pi != pj {
+			return pi < pj
+		}
+		return sortedFilenames[i] < sortedFilenames[j]
+	})
+	if len(target) > 0 {
+		for i, fn := range sortedFilenames {
+			cfg := configs[fn]
+			idx := findEditableOutboundIndex(cfg)
+			var oldOb map[string]any
+			if outs, ok := cfg["outbounds"].([]any); ok && idx >= 0 && idx < len(outs) {
+				oldOb, _ = outs[idx].(map[string]any)
+			}
+			newOb := entries[i%len(entries)].Outbound
+			changes = append(changes, ModifyOutboundChange{
+				FileName: fn, Tag: extractNodeTag(cfg), Port: extractListenPort(cfg),
+				OldOutbound: formatOutboundBrief(oldOb), NewOutbound: formatOutboundBrief(newOb),
+			})
+		}
+	} else {
+		for _, entry := range entries {
+			if entry.MatchIP == "" {
+				continue
+			}
+			matched := 0
+			for _, fn := range sortedFilenames {
+				cfg := configs[fn]
+				idx := findMatchingOutboundIndex(cfg, entry.MatchIP)
+				if idx < 0 {
+					continue
+				}
+				var oldOb map[string]any
+				if outs, ok := cfg["outbounds"].([]any); ok && idx < len(outs) {
+					oldOb, _ = outs[idx].(map[string]any)
+				}
+				changes = append(changes, ModifyOutboundChange{
+					FileName: fn, Tag: extractNodeTag(cfg), Port: extractListenPort(cfg),
+					OldOutbound: formatOutboundBrief(oldOb), NewOutbound: formatOutboundBrief(entry.Outbound),
+				})
+				matched++
+			}
+			if matched == 0 {
+				unmatched = append(unmatched, entry.MatchIP)
+			}
+		}
+	}
+	if len(changes) == 0 {
+		return ModifyOutboundPreview{Success: false, Message: "未匹配到可修改的节点", Unmatched: unmatched}, nil
+	}
+	msg := fmt.Sprintf("预览完成：预计修改 %d 个节点", len(changes))
+	if len(unmatched) > 0 {
+		msg += fmt.Sprintf("，未匹配 %d 个目标 IP（%s）", len(unmatched), strings.Join(unmatched, ", "))
+	}
+	return ModifyOutboundPreview{Success: true, Message: msg, Changes: changes, Unmatched: unmatched}, nil
+}
+
 func (s *Service) ModifyNodeOutbounds(alias string, filenames []string, outboundLines string, outboundProtocol string) (OperationResult, error) {
 	alias = strings.TrimSpace(alias)
 	if alias == "" {
 		return OperationResult{Success: false, Message: "VPS 不能为空"}, nil
 	}
-	outbounds := parseOutboundLines(outboundLines, outboundProtocol)
-	if len(outbounds) == 0 {
+	entries := parseOutboundMappingLines(outboundLines, outboundProtocol)
+	if len(entries) == 0 {
 		return OperationResult{Success: false, Message: "落地代理为空或格式错误"}, nil
 	}
 	unlock := s.lockNodeConfigAliases(alias)
@@ -469,6 +705,7 @@ func (s *Service) ModifyNodeOutbounds(alias string, filenames []string, outbound
 	if len(configs) == 0 {
 		return OperationResult{Success: false, Message: "该 VPS 暂无可修改的节点"}, nil
 	}
+	_, _ = s.BackupNow(alias)
 
 	target := map[string]bool{}
 	for _, filename := range filenames {
@@ -500,7 +737,7 @@ func (s *Service) ModifyNodeOutbounds(alias string, filenames []string, outbound
 		})
 		for i, filename := range targetFilenames {
 			config := configs[filename]
-			outbound := cloneMap(outbounds[i%len(outbounds)])
+			outbound := cloneMap(entries[i%len(entries)].Outbound)
 			index := findEditableOutboundIndex(config)
 			if index >= 0 {
 				applyOutboundAt(config, index, outbound)
@@ -514,15 +751,15 @@ func (s *Service) ModifyNodeOutbounds(alias string, filenames []string, outbound
 			return OperationResult{}, err
 		}
 		var message string
-		if len(outbounds) == len(changed) {
-			message = fmt.Sprintf("提交 %d 条落地已成功更新至 %d 个选中节点", len(outbounds), len(changed))
+		if len(entries) == len(changed) {
+			message = fmt.Sprintf("提交 %d 条落地已成功更新至 %d 个选中节点", len(entries), len(changed))
 		} else {
-			message = fmt.Sprintf("提交 %d 条落地已循环应用至 %d 个选中节点", len(outbounds), len(changed))
+			message = fmt.Sprintf("提交 %d 条落地已循环应用至 %d 个选中节点", len(entries), len(changed))
 		}
 		return OperationResult{Success: true, Message: message, Count: len(changed), Items: changed}, nil
 	}
 
-	// len(target) == 0: 严格根据提供的新 socks5 的 IP 进行 100% 精确匹配，只修改匹配该 IP 的落地节点
+	// len(target) == 0: 支持同 IP 精确匹配或 "旧IP => 新落地" 映射替换
 	failed := []string{}
 	changedSet := map[string]bool{}
 	matchedOutboundCount := 0
@@ -540,8 +777,8 @@ func (s *Service) ModifyNodeOutbounds(alias string, filenames []string, outbound
 		return sortedFilenames[i] < sortedFilenames[j]
 	})
 
-	for _, outbound := range outbounds {
-		targetServer := normalizeServerAddress(asString(outbound["server"]))
+	for _, entry := range entries {
+		targetServer := entry.MatchIP
 		if targetServer == "" {
 			continue
 		}
@@ -552,7 +789,7 @@ func (s *Service) ModifyNodeOutbounds(alias string, filenames []string, outbound
 			if idx < 0 {
 				continue
 			}
-			applyOutboundAt(config, idx, cloneMap(outbound))
+			applyOutboundAt(config, idx, cloneMap(entry.Outbound))
 			configs[filename] = config
 			if !changedSet[filename] {
 				changedSet[filename] = true
@@ -561,7 +798,7 @@ func (s *Service) ModifyNodeOutbounds(alias string, filenames []string, outbound
 			matchedThisOutbound++
 		}
 		if matchedThisOutbound == 0 {
-			failed = append(failed, asString(outbound["server"]))
+			failed = append(failed, targetServer)
 		} else {
 			matchedOutboundCount++
 		}
@@ -578,7 +815,7 @@ func (s *Service) ModifyNodeOutbounds(alias string, filenames []string, outbound
 		return OperationResult{}, err
 	}
 
-	inputCount := len(outbounds)
+	inputCount := len(entries)
 	var message string
 	if matchedOutboundCount == inputCount {
 		if len(changed) == matchedOutboundCount {
@@ -719,7 +956,42 @@ func (s *Service) saveBackupSnapshot(alias string, data []byte) (BackupFile, err
 		_ = os.Remove(path)
 		return BackupFile{}, fmt.Errorf("读取备份文件信息失败: %w", err)
 	}
+	pruneOldBackups(dir, 30)
 	return BackupFile{Name: displayName, Path: path, SourceAlias: alias, Size: info.Size(), Modified: info.ModTime().Format("2006-01-02 15:04:05")}, nil
+}
+
+func pruneOldBackups(dir string, maxKeep int) {
+	if maxKeep <= 0 {
+		return
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil || len(entries) <= maxKeep {
+		return
+	}
+	type fileItem struct {
+		path    string
+		modTime time.Time
+	}
+	list := make([]fileItem, 0, len(entries))
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(strings.ToLower(entry.Name()), "_all.json") {
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil {
+			continue
+		}
+		list = append(list, fileItem{path: filepath.Join(dir, entry.Name()), modTime: info.ModTime()})
+	}
+	if len(list) <= maxKeep {
+		return
+	}
+	sort.Slice(list, func(i, j int) bool {
+		return list[i].modTime.After(list[j].modTime)
+	})
+	for _, old := range list[maxKeep:] {
+		_ = os.Remove(old.path)
+	}
 }
 
 func backupDisplayInfo(physicalName string) (string, string) {
@@ -873,8 +1145,74 @@ func (s *Service) RestoreBackup(targetAlias string, backupPath string) CommandRe
 			Message:  fmt.Sprintf("安全拦截：该备份来源为 [%s]，与当前操作的服务器 [%s] 不一致！已阻止覆盖还原。如需跨服务器复制，请使用“迁移部署”。", sourceAlias, targetAlias),
 		}
 	}
-
+	_, _ = s.BackupNow(targetAlias)
 	return s.ImportAllJSONAndDeploy(targetAlias, content)
+}
+
+// PreviewBackupDiff 对比备份文件与目标 VPS 当前本地配置的差异，并检测跨机迁移时的 bind_address 风险。
+func (s *Service) PreviewBackupDiff(targetAlias string, backupPath string) (BackupDiffPreview, error) {
+	targetAlias = strings.TrimSpace(targetAlias)
+	resolvedPath, err := s.resolveBackupPath(backupPath)
+	if err != nil {
+		return BackupDiffPreview{Success: false, Message: "备份路径无效: " + err.Error()}, nil
+	}
+	content, err := s.ReadBackup(resolvedPath)
+	if err != nil {
+		return BackupDiffPreview{Success: false, Message: "读取备份失败: " + err.Error()}, nil
+	}
+	backupConfigs, err := parseNodeConfigText(content)
+	if err != nil {
+		return BackupDiffPreview{Success: false, Message: "备份内容解析失败: " + err.Error()}, nil
+	}
+	currentConfigs, _ := s.loadNodeConfigMap(targetAlias)
+	_, sourceAlias := backupDisplayInfo(filepath.Base(resolvedPath))
+	preview := BackupDiffPreview{
+		Success:      true,
+		SourceAlias:  sourceAlias,
+		TargetAlias:  targetAlias,
+		BackupCount:  len(backupConfigs),
+		CurrentCount: len(currentConfigs),
+		Added:        []string{},
+		Removed:      []string{},
+		Modified:     []string{},
+	}
+	for fn, bCfg := range backupConfigs {
+		cCfg, exists := currentConfigs[fn]
+		if !exists {
+			preview.Added = append(preview.Added, extractNodeTag(bCfg))
+		} else {
+			bRaw, _ := json.Marshal(buildAllJSON(map[string]map[string]any{fn: bCfg}))
+			cRaw, _ := json.Marshal(buildAllJSON(map[string]map[string]any{fn: cCfg}))
+			if !bytes.Equal(bRaw, cRaw) {
+				preview.Modified = append(preview.Modified, extractNodeTag(bCfg))
+			}
+		}
+		if sourceAlias != "" && targetAlias != "" && !strings.EqualFold(sourceAlias, targetAlias) {
+			if outs, ok := bCfg["outbounds"].([]any); ok {
+				for _, rawOut := range outs {
+					if ob, ok := rawOut.(map[string]any); ok {
+						if bindIP := asString(ob["inet4_bind_address"]); bindIP != "" {
+							preview.BindIPWarnings = append(preview.BindIPWarnings, fmt.Sprintf("%s 绑定了源机 IP %s", extractNodeTag(bCfg), bindIP))
+						}
+					}
+				}
+			}
+		}
+	}
+	for fn, cCfg := range currentConfigs {
+		if _, exists := backupConfigs[fn]; !exists {
+			preview.Removed = append(preview.Removed, extractNodeTag(cCfg))
+		}
+	}
+	sort.Strings(preview.Added)
+	sort.Strings(preview.Removed)
+	sort.Strings(preview.Modified)
+	preview.Message = fmt.Sprintf("备份含 %d 个节点（当前 %d 个）：新增 %d、变更 %d、将移除 %d",
+		preview.BackupCount, preview.CurrentCount, len(preview.Added), len(preview.Modified), len(preview.Removed))
+	if len(preview.BindIPWarnings) > 0 {
+		preview.Message += fmt.Sprintf("；注意：检测到 %d 个绑定了源机 IP 的多IP节点", len(preview.BindIPWarnings))
+	}
+	return preview, nil
 }
 
 // MigrateBackup 明确将一个备份文件跨服务器迁移/克隆部署到 targetAlias。
@@ -891,6 +1229,7 @@ func (s *Service) MigrateBackup(targetAlias string, backupPath string) CommandRe
 	if err != nil {
 		return CommandResult{Success: false, ExitCode: -1, Message: "读取备份内容失败: " + err.Error()}
 	}
+	_, _ = s.BackupNow(targetAlias)
 	return s.ImportAllJSONAndDeploy(targetAlias, content)
 }
 

@@ -1203,6 +1203,34 @@ func (a *App) SaveMiddleSettings(settings core.MiddleSettings) (core.MiddleSetti
 	return a.service.SaveMiddleSettings(settings)
 }
 
+func (a *App) InitTrafficCounter(alias string) core.CommandResult {
+	if err := a.requireAccess(); err != nil {
+		return core.CommandResult{Success: false, ExitCode: -1, Message: err.Error()}
+	}
+	return a.service.InitTrafficCounter(alias)
+}
+
+func (a *App) CheckAllJSON(alias, text string) core.CommandResult {
+	if err := a.requireAccess(); err != nil {
+		return core.CommandResult{Success: false, ExitCode: -1, Message: err.Error()}
+	}
+	return a.service.CheckAllJSON(alias, text)
+}
+
+func (a *App) PreviewModifyNodeOutbounds(alias string, filenames []string, outboundLines, outboundProtocol string) (core.ModifyOutboundPreview, error) {
+	if err := a.requireAccess(); err != nil {
+		return core.ModifyOutboundPreview{}, err
+	}
+	return a.service.PreviewModifyNodeOutbounds(alias, filenames, outboundLines, outboundProtocol)
+}
+
+func (a *App) PreviewBackupDiff(targetAlias, backupPath string) (core.BackupDiffPreview, error) {
+	if err := a.requireAccess(); err != nil {
+		return core.BackupDiffPreview{}, err
+	}
+	return a.service.PreviewBackupDiff(targetAlias, backupPath)
+}
+
 func downloadDirectory() string {
 	home, err := os.UserHomeDir()
 	if err != nil {

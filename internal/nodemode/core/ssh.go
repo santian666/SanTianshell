@@ -3,6 +3,7 @@ package core
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -125,14 +126,39 @@ func (s *Service) RefreshVPSStateInteractive(alias string, _ bool) VPSRuntimeSta
 	return s.refreshVPSState(alias, true)
 }
 
+func classifySSHErrorCategory(err error) (string, string) {
+	if err == nil {
+		return "", ""
+	}
+	msg := strings.ToLower(err.Error())
+	switch {
+	case isSSHAuthError(err):
+		return "auth_failed", "SSH 认证失败（请检查密码或私钥）"
+	case strings.Contains(msg, "host key") || strings.Contains(msg, "主机密钥") || strings.Contains(msg, "knownhosts"):
+		return "hostkey_failed", "SSH 主机指纹校验未通过（请在主机设置中重置或确认指纹）"
+	case strings.Contains(msg, "socks") || strings.Contains(msg, "代理"):
+		return "proxy_failed", "SSH 代理通道不可达（请检查本地/节点代理配置）"
+	case strings.Contains(msg, "timeout") || strings.Contains(msg, "i/o timeout") || strings.Contains(msg, "deadline exceeded"):
+		return "timeout", "SSH 连接超时（请检查服务器网络、端口或防火墙）"
+	default:
+		return "network_failed", "SSH 连接失败"
+	}
+}
+
 func (s *Service) refreshVPSState(alias string, interactive bool) VPSRuntimeState {
 	state := VPSRuntimeState{Alias: strings.TrimSpace(alias), Status: "ssh_failed", StartPort: 20000}
 	vps, err := s.getVPS(alias)
 	if err != nil {
 		state.Message = err.Error()
+		state.ErrorCategory = "config_error"
 		return state
 	}
-	state.Alias = firstNonEmpty(strings.TrimSpace(vps.Alias), strings.TrimSpace(vps.ID))
+	canonicalAlias := firstNonEmpty(strings.TrimSpace(vps.Alias), strings.TrimSpace(vps.ID))
+	state.Alias = canonicalAlias
+
+	localConfigs, _ := s.loadNodeConfigMap(canonicalAlias)
+	state.NodeCount, state.StartPort = nodeConfigRuntimeSummary(localConfigs)
+
 	var client *ssh.Client
 	var release func()
 	if interactive {
@@ -141,74 +167,94 @@ func (s *Service) refreshVPSState(alias string, interactive bool) VPSRuntimeStat
 		client, release, err = s.acquireSSH(vps, 60)
 	}
 	if err != nil {
-		state.Message = err.Error()
+		cat, hint := classifySSHErrorCategory(err)
+		state.ErrorCategory = cat
+		if err.Error() != "" {
+			state.Message = err.Error()
+		} else {
+			state.Message = hint
+		}
 		return state
 	}
 	defer release()
 
-	statusResult := executeSSH(client, s.wrapRootCommand(vps, remoteSBCommand("s")), 30)
-	state.Status = singboxStatusFromResult(statusResult)
-
-	canonicalAlias := firstNonEmpty(strings.TrimSpace(vps.Alias), strings.TrimSpace(vps.ID))
-	checkCmd := s.wrapRootCommand(vps, "if [ -f /etc/sing-box/conf/all.json ]; then cat /etc/sing-box/conf/all.json; else echo '__SAN_TIAN_SHELL_NOT_FOUND__'; fi")
-	checkRes := executeSSH(client, checkCmd, 30)
-	if !checkRes.Success {
-		configs, _, err := readManagedRemoteNodeConfigs(func(path string) ([]byte, error) {
-			return s.downloadRemoteConfig(client, vps, path)
-		})
-		if err != nil {
-			state.Message = "状态刷新完成，未检测到 SanTianShell 节点配置"
-			return state
-		}
-		deletedCount, _ := s.reconcileLocalNodesWithRemote(canonicalAlias, configs)
-		state.NodeCount, state.StartPort = nodeConfigRuntimeSummary(configs)
-		if deletedCount > 0 {
-			state.Message = fmt.Sprintf("状态刷新完成：已同步删除 %d 个服务器不存在的本地节点（当前节点数：%d）", deletedCount, state.NodeCount)
-		} else {
-			state.Message = fmt.Sprintf("状态刷新完成，远端节点数：%d，下一可用端口：%d", state.NodeCount, state.StartPort)
-		}
-		return state
+	// 单次 SSH 同时探测 sing-box 状态、内核版本、运行时长与远端 all.json 哈希，避免多次往返且不静默删除本地配置
+	probeScript := strings.Join([]string{
+		`echo "===SB_STATUS==="`,
+		remoteSBCommand("s") + ` || true`,
+		`echo "===SB_VERSION==="`,
+		`sb_bin="/etc/sing-box/bin/sing-box"; [ -x "$sb_bin" ] || sb_bin=$(command -v sing-box 2>/dev/null || true); if [ -n "$sb_bin" ]; then "$sb_bin" version 2>/dev/null | head -n 1; fi`,
+		`echo "===SB_UPTIME==="`,
+		`if command -v systemctl >/dev/null 2>&1; then systemctl show -p ActiveEnterTimestamp --value sing-box 2>/dev/null || true; fi`,
+		`echo "===SB_HASH==="`,
+		`if [ -f /etc/sing-box/conf/all.json ]; then if command -v sha256sum >/dev/null 2>&1; then sha256sum /etc/sing-box/conf/all.json | awk '{print $1}'; else wc -c < /etc/sing-box/conf/all.json; fi; else echo "__MISSING__"; fi`,
+	}, "\n")
+	probeRes := executeSSH(client, s.wrapRootCommand(vps, probeScript), 30)
+	sections := splitProbeSections(probeRes.Stdout)
+	statusOut := sections["SB_STATUS"]
+	state.Status = parseSingboxStatus(statusOut, probeRes.Stderr, probeRes.ExitCode)
+	if verLine := strings.TrimSpace(sections["SB_VERSION"]); verLine != "" {
+		verLine = strings.TrimPrefix(verLine, "sing-box version ")
+		state.CoreVersion = strings.TrimSpace(verLine)
 	}
+	state.Uptime = strings.TrimSpace(sections["SB_UPTIME"])
 
-	stdout := strings.TrimSpace(checkRes.Stdout)
-	if strings.Contains(stdout, "__SAN_TIAN_SHELL_NOT_FOUND__") {
-		deletedCount, _ := s.clearLocalNodesForVPS(canonicalAlias)
-		state.NodeCount = 0
-		state.StartPort = 20000
-		if deletedCount > 0 {
-			state.Message = fmt.Sprintf("状态刷新完成：经核验服务器无节点配置，本地已同步删除 %d 个节点", deletedCount)
+	remoteHash := strings.TrimSpace(sections["SB_HASH"])
+	localHasNodes := len(localConfigs) > 0
+	if remoteHash == "" || remoteHash == "__MISSING__" {
+		if localHasNodes {
+			state.ConfigDiff = true
+			state.Message = fmt.Sprintf("状态刷新完成（核心：%s），远端未检测到 all.json，本地保留 %d 个节点（未自动删除）", firstNonEmpty(state.CoreVersion, "未知"), state.NodeCount)
 		} else {
 			state.Message = "状态刷新完成，服务器无节点配置"
 		}
 		return state
 	}
 
-	remoteConfigs, err := splitAllJSON([]byte(stdout))
-	if err != nil {
-		state.Message = "状态刷新完成，远端配置解析失败（已保留本地数据）: " + err.Error()
+	if !localHasNodes {
+		state.ConfigDiff = true
+		state.Message = fmt.Sprintf("状态刷新完成（核心：%s），检测到远端存在配置而本地为空，可点击「同步配置」拉取", firstNonEmpty(state.CoreVersion, "未知"))
 		return state
 	}
 
-	if len(remoteConfigs) == 0 {
-		deletedCount, _ := s.clearLocalNodesForVPS(canonicalAlias)
-		state.NodeCount = 0
-		state.StartPort = 20000
-		if deletedCount > 0 {
-			state.Message = fmt.Sprintf("状态刷新完成：经核验服务器无节点配置，本地已同步删除 %d 个节点", deletedCount)
-		} else {
-			state.Message = "状态刷新完成，服务器无节点配置"
-		}
+	localHash := fmt.Sprintf("%x", sha256.Sum256(buildAllJSON(localConfigs)))
+	if len(remoteHash) == 64 && !strings.EqualFold(remoteHash, localHash) {
+		state.ConfigDiff = true
+		state.Message = fmt.Sprintf("状态刷新完成（本地 %d 个节点，核心：%s），远端配置与本地存在差异，可点击「同步配置」对齐", state.NodeCount, firstNonEmpty(state.CoreVersion, "未知"))
 		return state
 	}
-
-	deletedCount, _ := s.reconcileLocalNodesWithRemote(canonicalAlias, remoteConfigs)
-	state.NodeCount, state.StartPort = nodeConfigRuntimeSummary(remoteConfigs)
-	if deletedCount > 0 {
-		state.Message = fmt.Sprintf("状态刷新完成：已同步删除 %d 个服务器不存在的本地节点（当前节点数：%d）", deletedCount, state.NodeCount)
-	} else {
-		state.Message = fmt.Sprintf("状态刷新完成，远端节点数：%d，下一可用端口：%d", state.NodeCount, state.StartPort)
+	state.Synced = true
+	state.Message = fmt.Sprintf("状态刷新完成，节点数：%d，下一可用端口：%d", state.NodeCount, state.StartPort)
+	if state.CoreVersion != "" {
+		state.Message += fmt.Sprintf("，核心：%s", state.CoreVersion)
 	}
 	return state
+}
+
+func splitProbeSections(raw string) map[string]string {
+	sections := map[string]string{}
+	current := ""
+	var buf strings.Builder
+	flush := func() {
+		if current != "" {
+			sections[current] = strings.TrimSpace(buf.String())
+		}
+		buf.Reset()
+	}
+	for _, line := range strings.Split(strings.ReplaceAll(raw, "\r\n", "\n"), "\n") {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "===") && strings.HasSuffix(trimmed, "===") && len(trimmed) > 6 {
+			flush()
+			current = strings.Trim(trimmed, "=")
+			continue
+		}
+		if current != "" {
+			buf.WriteString(line)
+			buf.WriteByte('\n')
+		}
+	}
+	flush()
+	return sections
 }
 
 func singboxStatusFromResult(result CommandResult) string {
@@ -227,6 +273,33 @@ func (s *Service) ControlSingbox(alias string, action string) CommandResult {
 	case "start", "stop", "restart", "status":
 	default:
 		return CommandResult{Success: false, ExitCode: -1, Message: "无效的 sing-box 操作"}
+	}
+	if action == "restart" {
+		cmd := strings.Join([]string{
+			`sb_bin="/etc/sing-box/bin/sing-box"; [ -x "$sb_bin" ] || sb_bin=$(command -v sing-box 2>/dev/null || true)`,
+			`if [ -n "$sb_bin" ] && [ -x "$sb_bin" ] && [ -f /etc/sing-box/config.json ]; then`,
+			`  if ! "$sb_bin" check -c /etc/sing-box/config.json -C /etc/sing-box/conf; then`,
+			`    echo "sing-box 配置预检失败，已取消重启（原服务未中断）" >&2`,
+			`    exit 1`,
+			`  fi`,
+			`fi`,
+			remoteSBCommand("restart"),
+			`sleep 1`,
+			`if command -v systemctl >/dev/null 2>&1; then`,
+			`  if ! systemctl is-active --quiet sing-box 2>/dev/null; then`,
+			`    echo "=== sing-box 重启后未处于运行状态，最近错误日志 ===" >&2`,
+			`    journalctl -u sing-box -n 30 --no-pager 2>&1 || tail -n 30 /var/log/sing-box/service.log 2>&1 || true`,
+			`    exit 1`,
+			`  fi`,
+			`fi`,
+		}, "\n")
+		res := s.RunSSHCommand(alias, cmd, 60)
+		if res.Success {
+			res.Message = "sing-box 配置预检通过，服务已重启并验证运行正常"
+		} else if res.Message == "" {
+			res.Message = "sing-box 重启或健康自检失败，请查看错误日志"
+		}
+		return res
 	}
 	sbAction := action
 	if action == "status" {
@@ -470,7 +543,7 @@ EOF
       mkdir -p /etc/systemd/resolved.conf.d
       cat << 'RESEOF' > /etc/systemd/resolved.conf.d/dns.conf 2>/dev/null || true
 [Resolve]
-DNS=1.1.1.1 8.8.8.8 10.20.30.40
+DNS=1.1.1.1 8.8.8.8
 FallbackDNS=8.8.4.4 1.0.0.1
 RESEOF
       systemctl enable --now systemd-resolved >/dev/null 2>&1 || true
@@ -555,10 +628,11 @@ EOF
     firewall-cmd --reload >/dev/null 2>&1 || true
   fi
 }
+install_mirror_url='https://ghfast.top/https://github.com/233boy/sing-box/raw/main/install.sh'
 if command -v curl >/dev/null 2>&1; then
-  curl -fsSL "$install_url" -o "$tmp_file"
+  curl -fsSL --connect-timeout 15 --max-time 60 "$install_url" -o "$tmp_file" || curl -fsSL --connect-timeout 15 --max-time 60 "$install_mirror_url" -o "$tmp_file"
 elif command -v wget >/dev/null 2>&1; then
-  wget -qO "$tmp_file" "$install_url"
+  wget -q --timeout=30 -O "$tmp_file" "$install_url" || wget -q --timeout=30 -O "$tmp_file" "$install_mirror_url"
 else
   echo '远端缺少 curl/wget，无法下载 sing-box 安装脚本。' >&2
   exit 127
@@ -605,7 +679,12 @@ func remoteSBCommand(action string) string {
 }
 
 func (s *Service) RebootVPS(alias string) CommandResult {
-	return s.RunSSHCommand(alias, "nohup reboot >/tmp/vps-management-reboot.log 2>&1 &", 10)
+	cmd := "nohup sh -c 'sleep 2; (systemctl reboot || /sbin/reboot || reboot)' >/tmp/vps-management-reboot.log 2>&1 &"
+	res := s.RunSSHCommand(alias, cmd, 12)
+	if res.Success {
+		res.Message = "已发送重启指令，服务器将在 2 秒后重启"
+	}
+	return res
 }
 
 func (s *Service) DebugVPS(alias string, action string, target string, port int) CommandResult {
@@ -614,11 +693,16 @@ func (s *Service) DebugVPS(alias string, action string, target string, port int)
 	if action == "iperf3" {
 		return s.debugIperf3(alias, target)
 	}
-	if action != "ping" && action != "mtr" && action != "port" {
+	if action != "ping" && action != "mtr" && action != "port" && action != "dns" && action != "exitip" {
 		return CommandResult{Success: false, ExitCode: -1, Message: "调试动作无效"}
 	}
-	if _, err := validateDebugTarget(target); err != nil {
-		return CommandResult{Success: false, ExitCode: -1, Message: err.Error(), Summary: err.Error()}
+	if action == "dns" && target == "" {
+		target = "google.com"
+	}
+	if action != "exitip" {
+		if _, err := validateDebugTarget(target); err != nil {
+			return CommandResult{Success: false, ExitCode: -1, Message: err.Error(), Summary: err.Error()}
+		}
 	}
 	if action == "port" && (port < 1 || port > 65535) {
 		return CommandResult{Success: false, ExitCode: -1, Message: "端口必须是 1-65535 的数字。", Summary: "端口必须是 1-65535 的数字。"}
@@ -633,9 +717,13 @@ func (s *Service) DebugVPS(alias string, action string, target string, port int)
 		return CommandResult{Success: false, ExitCode: -1, Message: msg + " " + err.Error(), Summary: msg}
 	}
 	defer release()
-	ready, installMessage := s.ensureDebugTool(client, vps, action)
-	if !ready {
-		return CommandResult{Success: false, ExitCode: -1, Message: installMessage, Summary: installMessage, Output: installMessage, InstallMessage: installMessage}
+	installMessage := ""
+	if action == "ping" || action == "mtr" || action == "port" {
+		var ready bool
+		ready, installMessage = s.ensureDebugTool(client, vps, action)
+		if !ready {
+			return CommandResult{Success: false, ExitCode: -1, Message: installMessage, Summary: installMessage, Output: installMessage, InstallMessage: installMessage}
+		}
 	}
 	var command string
 	timeoutSeconds := 30
@@ -650,12 +738,25 @@ func (s *Service) DebugVPS(alias string, action string, target string, port int)
 		tcpProbe := shellQuote("cat < /dev/null > /dev/tcp/" + target + "/" + strconv.Itoa(port))
 		command = "if command -v nc >/dev/null 2>&1; then nc -vz -w 5 " + shellQuote(target) + " " + shellQuote(strconv.Itoa(port)) + "; else bash -lc " + tcpProbe + "; fi"
 		timeoutSeconds = 20
+	case "dns":
+		tQ := shellQuote(target)
+		command = "if command -v dig >/dev/null 2>&1; then dig +time=3 +tries=2 " + tQ + "; elif command -v getent >/dev/null 2>&1; then getent ahosts " + tQ + "; elif command -v nslookup >/dev/null 2>&1; then nslookup " + tQ + "; else echo '缺少 dig/getent/nslookup' >&2; exit 127; fi"
+		timeoutSeconds = 15
+	case "exitip":
+		command = "echo '=== IPv4 出口 ==='; curl -4 -fsS --max-time 6 https://api.ipify.org 2>&1 || echo '不可用'; echo ''; echo '=== IPv6 出口 ==='; curl -6 -fsS --max-time 6 https://api64.ipify.org 2>&1 || echo '不可用'; echo ''; echo '=== Cloudflare 204 连通性 ==='; curl -fsS -o /dev/null -w 'HTTP %{http_code}, 建连 %{time_connect}s, 总耗时 %{time_total}s\n' --max-time 8 https://cp.cloudflare.com/generate_204 2>&1"
+		timeoutSeconds = 25
 	}
 	result := executeSSH(client, command, timeoutSeconds)
 	output := mergeCommandOutput(result.Stdout, result.Stderr)
 	result.Output = output
 	result.InstallMessage = installMessage
-	result.Title = map[string]string{"ping": "Ping 连通性检测", "mtr": "MTR 路由追踪", "port": "IP + 端口检测"}[action]
+	result.Title = map[string]string{
+		"ping":   "Ping 连通性检测",
+		"mtr":    "MTR 路由追踪",
+		"port":   "IP + 端口检测",
+		"dns":    "DNS 解析检测",
+		"exitip": "出口 IP 与网络连通检测",
+	}[action]
 	switch action {
 	case "ping":
 		result.Summary = pingDebugSummary(target, output, result.ExitCode)
@@ -664,6 +765,20 @@ func (s *Service) DebugVPS(alias string, action string, target string, port int)
 		result.Analysis = analyzeMtrOutput(output, target, result.ExitCode)
 	case "port":
 		result.Summary = portDebugSummary(target, port, result.ExitCode)
+		result.Analysis = result.Summary
+	case "dns":
+		if result.Success {
+			result.Summary = fmt.Sprintf("DNS 解析 %s 成功", target)
+		} else {
+			result.Summary = fmt.Sprintf("DNS 解析 %s 失败", target)
+		}
+		result.Analysis = result.Summary
+	case "exitip":
+		if result.Success {
+			result.Summary = "出口 IP 与外网连通性检测完成"
+		} else {
+			result.Summary = "出口 IP 检测失败或外网受限"
+		}
 		result.Analysis = result.Summary
 	}
 	result.Message = result.Summary
@@ -724,26 +839,28 @@ func (s *Service) debugIperf3(clientAlias string, serverAlias string) CommandRes
 
 	runID := fmt.Sprintf("vps_mgmt_iperf3_%d", time.Now().UnixNano())
 	runIDQ := shellQuote(runID)
-	portQ := shellQuote("5201")
-	startCmd := "rm -f /tmp/" + runIDQ + ".log /tmp/" + runIDQ + ".pid; nohup iperf3 -s -p " + portQ + " > /tmp/" + runIDQ + ".log 2>&1 & echo $! > /tmp/" + runIDQ + ".pid; cat /tmp/" + runIDQ + ".pid"
+	iperfPort := 15201 + int(time.Now().UnixNano()%95)
+	portStr := strconv.Itoa(iperfPort)
+	portQ := shellQuote(portStr)
+	startCmd := "rm -f /tmp/" + runIDQ + ".log /tmp/" + runIDQ + ".pid; nohup sh -c 'if command -v timeout >/dev/null 2>&1; then exec timeout 120 iperf3 -s -p " + portQ + "; else exec iperf3 -s -p " + portQ + "; fi' > /tmp/" + runIDQ + ".log 2>&1 & echo $! > /tmp/" + runIDQ + ".pid; cat /tmp/" + runIDQ + ".pid"
 	startResult := executeSSH(server, startCmd, 10)
 	if !startResult.Success {
 		output := mergeCommandOutput(startResult.Stdout, startResult.Stderr)
 		return CommandResult{Success: false, Stdout: startResult.Stdout, Stderr: startResult.Stderr, ExitCode: startResult.ExitCode, Message: "目标 VPS " + serverAlias + " 启动 IPerf3 服务端失败。", Summary: "目标 VPS " + serverAlias + " 启动 IPerf3 服务端失败。", Output: output}
 	}
-	defer executeSSH(server, "if [ -f /tmp/"+runIDQ+".pid ]; then kill $(cat /tmp/"+runIDQ+".pid) >/dev/null 2>&1 || true; rm -f /tmp/"+runIDQ+".pid; fi", 8)
+	defer executeSSH(server, "if [ -f /tmp/"+runIDQ+".pid ]; then kill $(cat /tmp/"+runIDQ+".pid) >/dev/null 2>&1 || true; fi; rm -f /tmp/"+runIDQ+".pid /tmp/"+runIDQ+".log", 8)
 	time.Sleep(700 * time.Millisecond)
 
 	var result CommandResult
 	if useLocalClient {
-		forwardHost, forwardPort, stopForward, err := startLocalTCPForward(server.Dial, "127.0.0.1:5201")
+		forwardHost, forwardPort, stopForward, err := startLocalTCPForward(server.Dial, "127.0.0.1:"+portStr)
 		if err != nil {
 			return CommandResult{Success: false, ExitCode: -1, Message: "建立 IPerf3 SSH 转发失败：" + err.Error(), Summary: "建立 IPerf3 SSH 转发失败。"}
 		}
 		defer stopForward()
 		result = executeLocalIperf3Pair(forwardHost, forwardPort)
 	} else {
-		result = executeRemoteIperf3Pair(client, serverVPS.Address, "5201")
+		result = executeRemoteIperf3Pair(client, serverVPS.Address, portStr)
 	}
 	output := "当前 VPS：" + clientInstall + "\n目标 VPS：" + serverInstall + "\n\n" + mergeCommandOutput(result.Stdout, result.Stderr)
 	result.Title = "IPerf3 测速"
@@ -762,24 +879,281 @@ func (s *Service) GetTrafficRank(alias string) CommandResult {
 		raw, _ := json.Marshal(data)
 		return CommandResult{Success: true, Stdout: string(raw), Message: "本地没有可匹配端口的节点配置"}
 	}
-	portsJSON, _ := json.Marshal(ports)
-	script := trafficCollectScript()
-	cmd := "py=$(command -v python3 || command -v python || true); if [ -z \"$py\" ]; then echo '未找到 python3/python，无法采集流量排行' >&2; exit 127; fi; \"$py\" -c " + shellQuote(script) + " " + shellQuote(string(portsJSON))
+	// 零远端 python3 依赖：直接由 POSIX shell 采样 ss -tinH（间隔 0.5s）+ nftables 计数器，本地 Go 解析
+	cmd := strings.Join([]string{
+		`echo "===SS_FIRST==="`,
+		`ss -tinH 2>/dev/null || true`,
+		`sleep 0.5`,
+		`echo "===SS_SECOND==="`,
+		`ss -tinH 2>/dev/null || true`,
+		`echo "===NFT_TOTAL==="`,
+		`nft -j list table inet nsb_traffic 2>/dev/null || true`,
+	}, "\n")
 	result := s.RunSSHCommand(alias, cmd, 20)
 	if !result.Success {
 		return result
 	}
-	var data map[string]any
-	if err := json.Unmarshal([]byte(result.Stdout), &data); err != nil {
-		result.Success = false
-		result.Message = "远端流量采集结果解析失败：" + err.Error()
-		return result
+	sections := splitProbeSections(result.Stdout)
+	portSet := make(map[int]bool, len(ports))
+	for _, p := range ports {
+		portSet[p] = true
+	}
+	firstConns, _, has1 := parseSSConnections(sections["SS_FIRST"], portSet)
+	secondConns, counts, has2 := parseSSConnections(sections["SS_SECOND"], portSet)
+	realtimeRows := []map[string]any{}
+	if has1 || has2 || len(counts) > 0 {
+		realtimeRows = computeRealtimeTraffic(firstConns, secondConns, counts, ports, 0.5)
+	}
+	totalRows, totalAvailable := parseNftTrafficJSON(sections["NFT_TOTAL"], portSet, ports)
+	totalMsg := ""
+	if !totalAvailable {
+		totalMsg = "端口总流量统计未启用（点击上方「启用总流量统计」即可初始化 TCP+UDP 累计计数）"
+	}
+	data := map[string]any{
+		"success":         true,
+		"source":          "ss_tcp_go",
+		"sample_seconds":  0.5,
+		"realtime":        realtimeRows,
+		"total":           totalRows,
+		"total_available": totalAvailable,
+		"total_message":   totalMsg,
 	}
 	attachTrafficNodeInfo(data, nodeMap)
 	raw, _ := json.Marshal(data)
 	result.Stdout = string(raw)
 	result.Message = "流量采集完成"
 	return result
+}
+
+func (s *Service) InitTrafficCounter(alias string) CommandResult {
+	_, ports := s.trafficNodeMap(alias)
+	if len(ports) == 0 {
+		return CommandResult{Success: false, ExitCode: -1, Message: "本地没有可统计端口的节点配置"}
+	}
+	var rules strings.Builder
+	rules.WriteString("if ! command -v nft >/dev/null 2>&1; then echo '服务器未安装 nftables (nft)' >&2; exit 127; fi\n")
+	rules.WriteString("nft -f - <<'EOF'\n")
+	rules.WriteString("table inet nsb_traffic\n")
+	rules.WriteString("flush table inet nsb_traffic\n")
+	rules.WriteString("table inet nsb_traffic {\n")
+	for _, p := range ports {
+		rules.WriteString(fmt.Sprintf("  counter nsb_p%d_rx {}\n", p))
+		rules.WriteString(fmt.Sprintf("  counter nsb_p%d_tx {}\n", p))
+	}
+	rules.WriteString("  chain input {\n    type filter hook input priority 0; policy accept;\n")
+	for _, p := range ports {
+		rules.WriteString(fmt.Sprintf("    tcp dport %d counter name \"nsb_p%d_rx\"\n", p, p))
+		rules.WriteString(fmt.Sprintf("    udp dport %d counter name \"nsb_p%d_rx\"\n", p, p))
+	}
+	rules.WriteString("  }\n")
+	rules.WriteString("  chain output {\n    type filter hook output priority 0; policy accept;\n")
+	for _, p := range ports {
+		rules.WriteString(fmt.Sprintf("    tcp sport %d counter name \"nsb_p%d_tx\"\n", p, p))
+		rules.WriteString(fmt.Sprintf("    udp sport %d counter name \"nsb_p%d_tx\"\n", p, p))
+	}
+	rules.WriteString("  }\n}\nEOF\n")
+	res := s.RunSSHCommand(alias, rules.String(), 30)
+	if res.Success {
+		res.Message = fmt.Sprintf("已为 %d 个节点端口初始化 nftables TCP+UDP 总流量统计", len(ports))
+	}
+	return res
+}
+
+type ssConnSample struct {
+	Port    int
+	RxBytes int64
+	TxBytes int64
+}
+
+var (
+	reSSPort   = regexp.MustCompile(`:(\d+)$`)
+	reSSSent   = regexp.MustCompile(`\bbytes_sent:(\d+)`)
+	reSSAcked  = regexp.MustCompile(`\bbytes_acked:(\d+)`)
+	reSSRecv   = regexp.MustCompile(`\bbytes_received:(\d+)`)
+	reNftCount = regexp.MustCompile(`^nsb_p(\d+)_(rx|tx)$`)
+)
+
+func parseSSMetricsLine(text string) (int64, int64) {
+	var rx, tx int64
+	if m := reSSRecv.FindStringSubmatch(text); len(m) == 2 {
+		rx, _ = strconv.ParseInt(m[1], 10, 64)
+	}
+	if m := reSSSent.FindStringSubmatch(text); len(m) == 2 {
+		tx, _ = strconv.ParseInt(m[1], 10, 64)
+	} else if m := reSSAcked.FindStringSubmatch(text); len(m) == 2 {
+		tx, _ = strconv.ParseInt(m[1], 10, 64)
+	}
+	return rx, tx
+}
+
+func parseSSConnections(raw string, portSet map[int]bool) (map[string]ssConnSample, map[int]int, bool) {
+	conns := map[string]ssConnSample{}
+	counts := map[int]int{}
+	hasMetrics := false
+	currentKey := ""
+	for _, line := range strings.Split(strings.ReplaceAll(raw, "\r\n", "\n"), "\n") {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		if line[0] == ' ' || line[0] == '\t' {
+			if currentKey != "" {
+				rx, tx := parseSSMetricsLine(line)
+				if rx > 0 || tx > 0 {
+					hasMetrics = true
+				}
+				sample := conns[currentKey]
+				if rx > sample.RxBytes {
+					sample.RxBytes = rx
+				}
+				if tx > sample.TxBytes {
+					sample.TxBytes = tx
+				}
+				conns[currentKey] = sample
+			}
+			continue
+		}
+		parts := strings.Fields(line)
+		currentKey = ""
+		if len(parts) < 5 {
+			continue
+		}
+		m := reSSPort.FindStringSubmatch(parts[3])
+		if len(m) != 2 {
+			continue
+		}
+		p, err := strconv.Atoi(m[1])
+		if err != nil || !portSet[p] {
+			continue
+		}
+		currentKey = parts[3] + "|" + parts[4]
+		counts[p]++
+		rx, tx := parseSSMetricsLine(line)
+		if rx > 0 || tx > 0 {
+			hasMetrics = true
+		}
+		conns[currentKey] = ssConnSample{Port: p, RxBytes: rx, TxBytes: tx}
+	}
+	return conns, counts, hasMetrics
+}
+
+func computeRealtimeTraffic(first, second map[string]ssConnSample, counts map[int]int, ports []int, duration float64) []map[string]any {
+	if duration <= 0 {
+		duration = 0.5
+	}
+	type agg struct {
+		port  int
+		rxBps int64
+		txBps int64
+		conns int
+	}
+	byPort := make(map[int]*agg, len(ports))
+	for _, p := range ports {
+		byPort[p] = &agg{port: p, conns: counts[p]}
+	}
+	for key, cur := range second {
+		old := first[key]
+		rxDelta := cur.RxBytes - old.RxBytes
+		if rxDelta < 0 {
+			rxDelta = 0
+		}
+		txDelta := cur.TxBytes - old.TxBytes
+		if txDelta < 0 {
+			txDelta = 0
+		}
+		if entry, ok := byPort[cur.Port]; ok {
+			entry.rxBps += int64(float64(rxDelta) / duration)
+			entry.txBps += int64(float64(txDelta) / duration)
+		}
+	}
+	rows := make([]map[string]any, 0, len(ports))
+	for _, entry := range byPort {
+		rows = append(rows, map[string]any{
+			"port":                entry.port,
+			"rx_total_bytes":      int64(0),
+			"tx_total_bytes":      int64(0),
+			"total_bytes":         int64(0),
+			"rx_bytes_per_second": entry.rxBps,
+			"tx_bytes_per_second": entry.txBps,
+			"bytes_per_second":    entry.rxBps + entry.txBps,
+			"connection_count":    entry.conns,
+		})
+	}
+	sort.Slice(rows, func(i, j int) bool {
+		bi := rows[i]["bytes_per_second"].(int64)
+		bj := rows[j]["bytes_per_second"].(int64)
+		if bi != bj {
+			return bi > bj
+		}
+		return rows[i]["connection_count"].(int) > rows[j]["connection_count"].(int)
+	})
+	return rows
+}
+
+func parseNftTrafficJSON(raw string, portSet map[int]bool, ports []int) ([]map[string]any, bool) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return []map[string]any{}, false
+	}
+	var doc struct {
+		Nftables []struct {
+			Counter *struct {
+				Name  string `json:"name"`
+				Bytes int64  `json:"bytes"`
+			} `json:"counter"`
+		} `json:"nftables"`
+	}
+	if err := json.Unmarshal([]byte(raw), &doc); err != nil {
+		return []map[string]any{}, false
+	}
+	type agg struct {
+		port int
+		rx   int64
+		tx   int64
+	}
+	byPort := make(map[int]*agg, len(ports))
+	for _, p := range ports {
+		byPort[p] = &agg{port: p}
+	}
+	found := false
+	for _, item := range doc.Nftables {
+		if item.Counter == nil {
+			continue
+		}
+		m := reNftCount.FindStringSubmatch(item.Counter.Name)
+		if len(m) != 3 {
+			continue
+		}
+		p, err := strconv.Atoi(m[1])
+		if err != nil || !portSet[p] {
+			continue
+		}
+		found = true
+		if m[2] == "rx" {
+			byPort[p].rx += item.Counter.Bytes
+		} else {
+			byPort[p].tx += item.Counter.Bytes
+		}
+	}
+	if !found {
+		return []map[string]any{}, false
+	}
+	rows := make([]map[string]any, 0, len(ports))
+	for _, entry := range byPort {
+		rows = append(rows, map[string]any{
+			"port":                entry.port,
+			"rx_total_bytes":      entry.rx,
+			"tx_total_bytes":      entry.tx,
+			"total_bytes":         entry.rx + entry.tx,
+			"rx_bytes_per_second": int64(0),
+			"tx_bytes_per_second": int64(0),
+			"bytes_per_second":    int64(0),
+			"connection_count":    0,
+		})
+	}
+	sort.Slice(rows, func(i, j int) bool {
+		return rows[i]["total_bytes"].(int64) > rows[j]["total_bytes"].(int64)
+	})
+	return rows, true
 }
 
 type trafficNodeInfo struct {
@@ -826,22 +1200,27 @@ func extractInboundProtocol(config map[string]any) string {
 
 func attachTrafficNodeInfo(data map[string]any, nodeMap map[int]trafficNodeInfo) {
 	for _, key := range []string{"realtime", "total"} {
-		rows, ok := data[key].([]any)
-		if !ok {
-			continue
-		}
-		for _, raw := range rows {
-			row, ok := raw.(map[string]any)
-			if !ok {
-				continue
+		switch rows := data[key].(type) {
+		case []any:
+			for _, raw := range rows {
+				row, ok := raw.(map[string]any)
+				if !ok {
+					continue
+				}
+				if info, ok := nodeMap[asInt(row["port"])]; ok {
+					row["node_name"] = info.NodeName
+					row["group_name"] = info.GroupName
+					row["protocol"] = info.Protocol
+				}
 			}
-			info, ok := nodeMap[asInt(row["port"])]
-			if !ok {
-				continue
+		case []map[string]any:
+			for _, row := range rows {
+				if info, ok := nodeMap[asInt(row["port"])]; ok {
+					row["node_name"] = info.NodeName
+					row["group_name"] = info.GroupName
+					row["protocol"] = info.Protocol
+				}
 			}
-			row["node_name"] = info.NodeName
-			row["group_name"] = info.GroupName
-			row["protocol"] = info.Protocol
 		}
 	}
 }
@@ -971,6 +1350,10 @@ func (s *Service) UploadAllJSONAndDeleteRemoteNodes(alias string, filenames []st
 }
 
 func (s *Service) detectVPSIPs(alias string) ([]string, error) {
+	return s.detectVPSIPsWithOptions(alias, false)
+}
+
+func (s *Service) detectVPSIPsWithOptions(alias string, includeIPv6 bool) ([]string, error) {
 	vps, err := s.getVPS(alias)
 	if err != nil {
 		return nil, err
@@ -981,6 +1364,9 @@ func (s *Service) detectVPSIPs(alias string) ([]string, error) {
 	}
 	defer release()
 	cmd := "ip -o -4 addr show scope global | awk '{split($4,a,\"/\"); print a[1]}'"
+	if includeIPv6 {
+		cmd = "ip -o addr show scope global | awk '{split($4,a,\"/\"); print a[1]}'"
+	}
 	result := executeSSH(client, s.wrapRootCommand(vps, cmd), 20)
 	if !result.Success || strings.TrimSpace(result.Stdout) == "" {
 		result = executeSSH(client, s.wrapRootCommand(vps, "hostname -I | tr ' ' '\\n'"), 20)
@@ -993,7 +1379,10 @@ func (s *Service) detectVPSIPs(alias string) ([]string, error) {
 	for _, line := range strings.Split(result.Stdout, "\n") {
 		ip := strings.TrimSpace(line)
 		parsed := net.ParseIP(ip)
-		if parsed == nil || parsed.To4() == nil || parsed.IsLoopback() || parsed.IsUnspecified() || seen[ip] {
+		if parsed == nil || parsed.IsLoopback() || parsed.IsUnspecified() || parsed.IsLinkLocalUnicast() || parsed.IsLinkLocalMulticast() || seen[ip] {
+			continue
+		}
+		if !includeIPv6 && parsed.To4() == nil {
 			continue
 		}
 		seen[ip] = true
@@ -1001,6 +1390,47 @@ func (s *Service) detectVPSIPs(alias string) ([]string, error) {
 	}
 	sort.Strings(ips)
 	return ips, nil
+}
+
+// CheckAllJSON 在远端临时目录使用 sing-box check 预检配置，不覆盖现有 all.json 也不重启服务。
+func (s *Service) CheckAllJSON(alias string, text string) CommandResult {
+	alias = strings.TrimSpace(alias)
+	if alias == "" {
+		return CommandResult{Success: false, ExitCode: -1, Message: "VPS 不能为空"}
+	}
+	configs, err := parseNodeConfigText(text)
+	if err != nil {
+		return CommandResult{Success: false, ExitCode: -1, Message: "JSON 解析失败: " + err.Error()}
+	}
+	if err := validateNodeConfigMap(configs); err != nil {
+		return CommandResult{Success: false, ExitCode: -1, Message: "本地配置校验失败: " + err.Error()}
+	}
+	allJSON := buildAllJSON(configs)
+	vps, err := s.getVPS(alias)
+	if err != nil {
+		return CommandResult{Success: false, ExitCode: -1, Message: err.Error()}
+	}
+	client, release, err := s.acquireSSH(vps, 45)
+	if err != nil {
+		return CommandResult{Success: false, ExitCode: -1, Message: "SSH 连接失败，无法执行远端预检: " + err.Error()}
+	}
+	defer release()
+	checkScript := strings.Join([]string{
+		`set -e`,
+		`tmp_dir=$(mktemp -d /tmp/santianshell-check.XXXXXX)`,
+		`trap 'rm -rf "$tmp_dir"' EXIT`,
+		`cat > "$tmp_dir/all.json"`,
+		`sb_bin="/etc/sing-box/bin/sing-box"; [ -x "$sb_bin" ] || sb_bin=$(command -v sing-box 2>/dev/null || true)`,
+		`if [ -z "$sb_bin" ] || [ ! -x "$sb_bin" ]; then echo '远端未找到 sing-box 核心，已完成本地语法校验'; exit 0; fi`,
+		`if [ -f /etc/sing-box/config.json ]; then "$sb_bin" check -c /etc/sing-box/config.json -C "$tmp_dir"; else "$sb_bin" check -c "$tmp_dir/all.json"; fi`,
+	}, "\n")
+	res := executeSSHWithInput(client, s.wrapRootCommand(vps, checkScript), allJSON, 45)
+	if res.Success {
+		res.Message = fmt.Sprintf("远端 sing-box check 预检通过（共 %d 个节点），尚未覆盖或重启服务", len(configs))
+	} else {
+		res.Message = "远端 sing-box check 预检未通过：" + firstNonEmpty(strings.TrimSpace(res.Stderr), strings.TrimSpace(res.Stdout), res.Message)
+	}
+	return res
 }
 
 func (s *Service) connectSSHWithRetry(vps VPS, timeoutSeconds int, attempts int) (*ssh.Client, error) {
@@ -1356,6 +1786,13 @@ func (s *Service) SyncAllJSON(alias string) CommandResult {
 		return CommandResult{Success: false, ExitCode: -1, Message: err.Error()}
 	}
 	canonicalAlias := firstNonEmpty(strings.TrimSpace(vps.Alias), strings.TrimSpace(vps.ID))
+	// 同步覆盖本地前自动快照备份本地已有节点，防止误覆盖
+	backupNote := ""
+	if localConfigs, lErr := s.loadNodeConfigMap(canonicalAlias); lErr == nil && len(localConfigs) > 0 {
+		if bk, bErr := s.BackupNow(canonicalAlias); bErr == nil && bk.Name != "" {
+			backupNote = fmt.Sprintf("（同步前已自动备份本地配置：%s）", bk.Name)
+		}
+	}
 	client, release, err := s.acquireSSH(vps, 60)
 	if err != nil {
 		return CommandResult{Success: false, ExitCode: -1, Message: err.Error()}
@@ -1373,35 +1810,35 @@ func (s *Service) SyncAllJSON(alias string) CommandResult {
 		}
 		if len(configs) == 0 {
 			deletedCount, _ := s.clearLocalNodesForVPS(canonicalAlias)
-			msg := "同步完成，远端无节点配置"
+			msg := "同步完成，远端无节点配置" + backupNote
 			if deletedCount > 0 {
-				msg = fmt.Sprintf("同步完成：远端无节点配置，本地已同步删除 %d 个节点", deletedCount)
+				msg = fmt.Sprintf("同步完成：远端无节点配置，本地已同步删除 %d 个节点%s", deletedCount, backupNote)
 			}
 			return CommandResult{Success: true, Stdout: msg, Message: msg}
 		}
 		deletedCount, _ := s.reconcileLocalNodesWithRemote(canonicalAlias, configs)
-		msg := fmt.Sprintf("同步完成，节点数：%d，来源：%s", len(configs), remotePath)
+		msg := fmt.Sprintf("同步完成，节点数：%d，来源：%s%s", len(configs), remotePath, backupNote)
 		if deletedCount > 0 {
-			msg = fmt.Sprintf("同步完成，节点数：%d（已清理本地不存在节点 %d 个），来源：%s", len(configs), deletedCount, remotePath)
+			msg = fmt.Sprintf("同步完成，节点数：%d（已清理本地不存在节点 %d 个），来源：%s%s", len(configs), deletedCount, remotePath, backupNote)
 		}
-		return CommandResult{Success: true, Stdout: msg, Message: "同步配置完成"}
+		return CommandResult{Success: true, Stdout: msg, Message: msg}
 	}
 
 	stdout := strings.TrimSpace(checkRes.Stdout)
 	if strings.Contains(stdout, "__SAN_TIAN_SHELL_NOT_FOUND__") {
 		deletedCount, _ := s.clearLocalNodesForVPS(canonicalAlias)
-		msg := "同步完成：经核验服务器无节点配置"
+		msg := "同步完成：经核验服务器无节点配置" + backupNote
 		if deletedCount > 0 {
-			msg = fmt.Sprintf("同步完成：经核验服务器无节点配置，本地已同步删除 %d 个节点", deletedCount)
+			msg = fmt.Sprintf("同步完成：经核验服务器无节点配置，本地已同步删除 %d 个节点%s", deletedCount, backupNote)
 		}
 		return CommandResult{Success: true, Stdout: msg, Message: msg}
 	}
 
 	if len(stdout) == 0 {
 		deletedCount, _ := s.clearLocalNodesForVPS(canonicalAlias)
-		msg := "同步完成：服务器配置文件为空"
+		msg := "同步完成：服务器配置文件为空" + backupNote
 		if deletedCount > 0 {
-			msg = fmt.Sprintf("同步完成：服务器配置文件为空，本地已同步删除 %d 个节点", deletedCount)
+			msg = fmt.Sprintf("同步完成：服务器配置文件为空，本地已同步删除 %d 个节点%s", deletedCount, backupNote)
 		}
 		return CommandResult{Success: true, Stdout: msg, Message: msg}
 	}
@@ -1413,19 +1850,19 @@ func (s *Service) SyncAllJSON(alias string) CommandResult {
 
 	if len(remoteConfigs) == 0 {
 		deletedCount, _ := s.clearLocalNodesForVPS(canonicalAlias)
-		msg := "同步完成：经核验服务器无节点配置"
+		msg := "同步完成：经核验服务器无节点配置" + backupNote
 		if deletedCount > 0 {
-			msg = fmt.Sprintf("同步完成：经核验服务器无节点配置，本地已同步删除 %d 个节点", deletedCount)
+			msg = fmt.Sprintf("同步完成：经核验服务器无节点配置，本地已同步删除 %d 个节点%s", deletedCount, backupNote)
 		}
 		return CommandResult{Success: true, Stdout: msg, Message: msg}
 	}
 
 	deletedCount, _ := s.reconcileLocalNodesWithRemote(canonicalAlias, remoteConfigs)
-	msg := fmt.Sprintf("同步完成，节点数：%d", len(remoteConfigs))
+	msg := fmt.Sprintf("同步完成，节点数：%d%s", len(remoteConfigs), backupNote)
 	if deletedCount > 0 {
-		msg = fmt.Sprintf("同步完成，节点数：%d（已清理本地不存在节点 %d 个）", len(remoteConfigs), deletedCount)
+		msg = fmt.Sprintf("同步完成，节点数：%d（已清理本地不存在节点 %d 个）%s", len(remoteConfigs), deletedCount, backupNote)
 	}
-	return CommandResult{Success: true, Stdout: msg, Message: "同步配置完成"}
+	return CommandResult{Success: true, Stdout: msg, Message: msg}
 }
 
 type proxyDialConfig struct {
@@ -1675,6 +2112,10 @@ func socks5DialerWithForward(config proxyDialConfig, forward proxy.Dialer) (prox
 }
 
 func executeSSH(client *ssh.Client, command string, timeoutSeconds int) CommandResult {
+	return executeSSHWithInput(client, command, nil, timeoutSeconds)
+}
+
+func executeSSHWithInput(client *ssh.Client, command string, input []byte, timeoutSeconds int) CommandResult {
 	if timeoutSeconds <= 0 {
 		timeoutSeconds = 60
 	}
@@ -1685,6 +2126,9 @@ func executeSSH(client *ssh.Client, command string, timeoutSeconds int) CommandR
 	defer session.Close()
 
 	var stdout, stderr commandBuffer
+	if len(input) > 0 {
+		session.Stdin = bytes.NewReader(input)
+	}
 	session.Stdout = &stdout
 	session.Stderr = &stderr
 

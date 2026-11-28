@@ -589,6 +589,8 @@ function showEditableJson(title, content, context) {
   el("detailContent").removeAttribute("contenteditable");
   el("detailActions")?.classList.remove("hidden");
   el("copyDetailJsonBtn")?.classList.remove("hidden");
+  el("formatDetailJsonBtn")?.classList.add("hidden");
+  el("checkDetailJsonBtn")?.classList.add("hidden");
   el("editDetailJsonBtn")?.classList.remove("hidden");
   el("saveDetailJsonBtn")?.classList.add("hidden");
   el("exportDetailLogBtn")?.classList.add("hidden");
@@ -619,12 +621,48 @@ async function copyDetailJson() {
   await copyText(el("detailContent").textContent || "", "JSON 已复制");
 }
 
+function formatDetailJson() {
+  const pre = el("detailContent");
+  try {
+    const parsed = JSON.parse(pre.textContent || "");
+    pre.textContent = JSON.stringify(parsed, null, 2);
+    showToast("JSON 语法正确，已格式化");
+  } catch (err) {
+    showToast(`JSON 语法错误：${err?.message || err}`);
+  }
+}
+
+async function checkDetailJsonDryRun() {
+  const ctx = state.detailEditorContext;
+  if (!ctx?.alias) return showToast("没有可预检的 JSON");
+  const text = el("detailContent").textContent || "";
+  try {
+    JSON.parse(text);
+  } catch (err) {
+    return showToast(`本地 JSON 语法错误：${err?.message || err}`);
+  }
+  const btn = el("checkDetailJsonBtn");
+  if (btn) { btn.disabled = true; btn.textContent = "预检中..."; }
+  try {
+    const res = await api.CheckAllJSON(ctx.alias, text);
+    showToast(res?.message || (res?.success ? "预检通过" : "预检失败"));
+  } catch (err) {
+    showToast(`预检失败：${err?.message || err}`);
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = "仅预检"; }
+  }
+}
+
 function enableDetailJsonEdit() {
   if (!state.detailEditorContext) return showToast("没有可编辑的 JSON");
   state.detailEditorContext.editing = true;
   el("detailContent").setAttribute("contenteditable", "true");
   el("detailContent").focus();
   el("editDetailJsonBtn")?.classList.add("hidden");
+  el("formatDetailJsonBtn")?.classList.remove("hidden");
+  if (state.detailEditorContext.type === "all") {
+    el("checkDetailJsonBtn")?.classList.remove("hidden");
+  }
   el("saveDetailJsonBtn")?.classList.remove("hidden");
   showToast("已进入编辑模式");
 }
@@ -1708,6 +1746,7 @@ async function loadBackups() {
     <td class="code" title="${escapeHtml(file.name)}">${escapeHtml(file.name)}</td><td>${formatSize(file.size)}</td><td>${escapeHtml(file.modified)}</td>
     <td><div class="actions">
       <button class="btn small secondary" data-backup-action="read" data-path="${escapeHtml(file.path)}">${expanded ? "收起" : "查看"}</button>
+      <button class="btn small secondary" data-backup-action="diff" data-path="${escapeHtml(file.path)}">对比</button>
       <button class="btn small ${deployClass}" data-backup-action="restore" data-path="${escapeHtml(file.path)}" title="${deployTitle}">${deployLabel}</button>
       <button class="btn small danger" data-backup-action="delete" data-path="${escapeHtml(file.path)}">删除</button>
     </div></td>
@@ -1717,6 +1756,21 @@ async function loadBackups() {
   wireBackupTable();
 }
 
+async function previewBackupDiff(path) {
+  const target = state.backupTargetAlias || el("backupAliasFilter")?.value || "";
+  try {
+    const diff = await api.PreviewBackupDiff(target, path);
+    const lines = [diff.message || "对比完成"];
+    if (diff.added?.length) lines.push(`\n[将新增 ${diff.added.length} 个]\n- ${diff.added.join("\n- ")}`);
+    if (diff.modified?.length) lines.push(`\n[将变更 ${diff.modified.length} 个]\n- ${diff.modified.join("\n- ")}`);
+    if (diff.removed?.length) lines.push(`\n[将移除 ${diff.removed.length} 个]\n- ${diff.removed.join("\n- ")}`);
+    if (diff.bindIpWarnings?.length) lines.push(`\n[⚠ 跨机 IP 绑定警告]\n- ${diff.bindIpWarnings.join("\n- ")}`);
+    showDetail(`备份差异预览 (${target || "当前"})`, lines.join("\n"));
+  } catch (err) {
+    showToast(`对比失败：${err?.message || err}`);
+  }
+}
+
 function wireBackupTable() {
   el("backupRows").onclick = (event) => {
     const button = event.target.closest("button[data-backup-action]");
@@ -1724,6 +1778,7 @@ function wireBackupTable() {
     const path = button.dataset.path || "";
     const actions = {
       read: () => readBackup(path),
+      diff: () => previewBackupDiff(path),
       copy: () => copyBackupContent(path),
       edit: () => enableBackupJsonEdit(path),
       save: () => saveBackupJson(path),
@@ -2454,8 +2509,27 @@ async function controlSingbox(alias, action, button = null) {
   }
 }
 
+let trafficAutoTimer = 0;
+let singboxLogAutoTimer = 0;
+let singboxLogRawText = "";
+
+async function pollVPSRecoveryAfterReboot(alias) {
+  const maxAttempts = 36;
+  for (let i = 0; i < maxAttempts; i += 1) {
+    await new Promise((resolve) => window.setTimeout(resolve, 5000));
+    try {
+      const runtimeState = await api.RefreshVPSState(alias, false);
+      if (runtimeState && runtimeState.status && runtimeState.status !== "ssh_failed") {
+        await refreshStatusAfterVpsChange(alias);
+        showToast(`VPS【${alias}】已重启恢复上线（状态：${runtimeState.status}）`);
+        return;
+      }
+    } catch {}
+  }
+}
+
 async function rebootVps(alias, button = null) {
-  if (!await appConfirm(`确认重启 VPS ${alias} 吗？\n服务器会断开连接。`, "重启 VPS")) return;
+  if (!await appConfirm(`确认重启 VPS ${alias} 吗？\n服务器将断开连接，重启后软件会自动监测其恢复上线。`, "重启 VPS")) return;
   if (button) {
     button.disabled = true;
     button.textContent = "重启中...";
@@ -2464,7 +2538,9 @@ async function rebootVps(alias, button = null) {
   try {
     const result = await api.RebootVPS(alias);
     showResult(result);
-    if (result.success) await refreshStatusAfterVpsChange(alias, { delayMs: 3000 });
+    if (result.success) {
+      pollVPSRecoveryAfterReboot(alias).catch(() => {});
+    }
   } finally {
     if (button) {
       button.disabled = false;
@@ -2474,7 +2550,7 @@ async function rebootVps(alias, button = null) {
 }
 
 async function syncAllJson(alias, button = null) {
-  if (!await appConfirm(`确认从 ${alias} 拉取 SanTianShell 部署目录中的 all.json，并覆盖本地节点配置吗？\n其他 sing-box 配置不会导入。`, "同步配置")) return;
+  if (!await appConfirm(`确认从 ${alias} 拉取服务器 all.json 并同步到本地吗？\n同步前会自动为本地现有配置生成一份备份快照，可随时还原。`, "同步配置")) return;
   if (button) {
     button.disabled = true;
     button.textContent = "同步中...";
@@ -2497,6 +2573,8 @@ async function trafficRank(alias) {
   state.trafficLimit = 10;
   state.trafficMode = "realtime";
   state.trafficData = null;
+  if (el("trafficAutoRefresh")) el("trafficAutoRefresh").checked = false;
+  if (trafficAutoTimer) { window.clearInterval(trafficAutoTimer); trafficAutoTimer = 0; }
   setText("trafficTitle", `${alias} 流量排行`);
   document.querySelectorAll(".segment").forEach((btn) => btn.classList.toggle("active", btn.dataset.limit === "10"));
   setTrafficMode("realtime", false);
@@ -2506,7 +2584,28 @@ async function trafficRank(alias) {
 
 function closeTrafficModal() {
   state.trafficRequest += 1;
+  if (trafficAutoTimer) { window.clearInterval(trafficAutoTimer); trafficAutoTimer = 0; }
+  if (el("trafficAutoRefresh")) el("trafficAutoRefresh").checked = false;
   el("trafficModal").classList.add("hidden");
+}
+
+async function initTrafficCounterForModal() {
+  const alias = state.trafficAlias;
+  if (!alias) return;
+  const btn = el("initTrafficCounterBtn");
+  if (btn) { btn.disabled = true; btn.textContent = "初始化中..."; }
+  try {
+    const res = await api.InitTrafficCounter(alias);
+    showToast(res?.message || (res?.success ? "已启用总流量统计" : "启用失败"));
+    if (res?.success) {
+      setTrafficMode("total", false);
+      await refreshTrafficRank();
+    }
+  } catch (err) {
+    showToast(`启用总流量统计失败：${err?.message || err}`);
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = "启用总流量统计"; }
+  }
 }
 
 function formatTrafficBytes(value) {
@@ -3857,22 +3956,50 @@ async function runDebug(action) {
   }
 }
 
+function renderSingboxLogText() {
+  const pre = el("singboxLogContent");
+  if (!pre) return;
+  const level = el("singboxLogLevel")?.value || "all";
+  let shown = singboxLogRawText || "暂无日志输出";
+  if (level === "warn" && singboxLogRawText) {
+    const filtered = singboxLogRawText
+      .split(/\r?\n/)
+      .filter((line) => /\b(error|fatal|panic|warn|warning|failed|refused)\b/i.test(line) || line.startsWith("==="));
+    shown = filtered.length ? filtered.join("\n") : "当前日志中未检测到 ERROR / WARN 记录";
+  }
+  pre.textContent = shown;
+  pre.scrollTop = pre.scrollHeight;
+}
+
 async function viewSingboxLog(alias) {
   if (el("singboxLogAlias")) {
     fillAliasFilters();
     if (alias) el("singboxLogAlias").value = alias;
     else alias = el("singboxLogAlias").value;
   }
+  if (singboxLogAutoTimer) { window.clearInterval(singboxLogAutoTimer); singboxLogAutoTimer = 0; }
+  if (el("singboxLogAutoRefresh")) el("singboxLogAutoRefresh").checked = false;
   setText("singboxLogModalTitle", `${alias || "VPS"} sing-box 运行日志`);
   el("singboxLogModal")?.classList.remove("hidden");
   await refreshSingboxLog();
 }
 
 function closeSingboxLogModal() {
+  if (singboxLogAutoTimer) { window.clearInterval(singboxLogAutoTimer); singboxLogAutoTimer = 0; }
+  if (el("singboxLogAutoRefresh")) el("singboxLogAutoRefresh").checked = false;
   el("singboxLogModal")?.classList.add("hidden");
 }
 
-async function refreshSingboxLog() {
+function diagnoseSingboxLogWithAI() {
+  const alias = el("singboxLogAlias")?.value || "";
+  const content = (el("singboxLogContent")?.textContent || singboxLogRawText || "").trim();
+  if (!content) return showToast("暂无可供诊断的日志内容");
+  const excerpt = content.length > 6000 ? content.slice(-6000) : content;
+  window.parent?.postMessage({ type: "node-ai-diagnose", alias, log: excerpt }, "*");
+  closeSingboxLogModal();
+}
+
+async function refreshSingboxLog(silent = false) {
   const alias = el("singboxLogAlias")?.value || "";
   const lines = Number(el("singboxLogLines")?.value || 200);
   const pre = el("singboxLogContent");
@@ -3883,14 +4010,11 @@ async function refreshSingboxLog() {
   }
   setText("singboxLogModalTitle", `${alias} sing-box 运行日志`);
   if (status) status.textContent = "正在拉取日志...";
-  if (pre) pre.textContent = "正在连接 VPS 并读取 sing-box 运行日志，请稍候...";
+  if (!silent && pre) pre.textContent = "正在连接 VPS 并读取 sing-box 运行日志，请稍候...";
   try {
     const result = await api.GetSingboxLog(alias, lines);
-    const content = result.output || result.stdout || result.stderr || result.message || "暂无日志输出";
-    if (pre) {
-      pre.textContent = content;
-      pre.scrollTop = pre.scrollHeight;
-    }
+    singboxLogRawText = result.output || result.stdout || result.stderr || result.message || "暂无日志输出";
+    renderSingboxLogText();
     const timeStr = new Date().toLocaleTimeString();
     if (status) status.textContent = `已获取 (更新于 ${timeStr})`;
   } catch (err) {
@@ -4582,6 +4706,29 @@ on("viewMultiIpResultBtn", "click", () => viewGeneratedNodes(el("viewMultiIpResu
 on("multiIpInboundProtocol", "change", refreshMultiIpProtocolUI);
 on("closeModifyModalBtn", "click", closeModifyModal);
 on("cancelModifyModalBtn", "click", closeModifyModal);
+async function previewModifyOutbound() {
+  const alias = el("modifyAlias")?.value || "";
+  const lines = el("modifyOutboundLines")?.value || "";
+  const box = el("modifyPreviewBox");
+  if (!alias || !lines.trim()) return showToast("请先输入要替换的落地配置");
+  try {
+    const filenames = Array.isArray(state.modifyTargetFilenames) ? state.modifyTargetFilenames : [];
+    const res = await api.PreviewModifyNodeOutbounds(alias, filenames, lines, "socks");
+    if (box) {
+      box.classList.remove("hidden");
+      if (!res?.success) {
+        box.textContent = res?.message || "未匹配到可修改节点";
+      } else {
+        const previewLines = [res.message, ...(res.changes || []).map((c) => `• ${c.tag} (:${c.port})  ${c.oldOutbound}  →  ${c.newOutbound}`)];
+        box.textContent = previewLines.join("\n");
+      }
+    }
+  } catch (err) {
+    showToast(`预览失败：${err?.message || err}`);
+  }
+}
+
+on("previewModifyBtn", "click", previewModifyOutbound);
 on("saveModifyBtn", "click", saveModifyOutbound);
 on("modifyOutboundLines", "input", updateModifyLinesCount);
 on("closeBatchRuleModalBtn", "click", closeBatchRules);
@@ -4591,6 +4738,8 @@ on("applyBatchRuleBtn", "click", applyBatchRules);
 on("debugPingBtn", "click", () => runDebug("ping"));
 on("debugMtrBtn", "click", () => runDebug("mtr"));
 on("debugPortBtn", "click", () => runDebug("port"));
+on("debugDnsBtn", "click", () => runDebug("dns"));
+on("debugExitIpBtn", "click", () => runDebug("exitip"));
 on("debugIperfBtn", "click", () => runDebug("iperf3"));
 on("debugIperfCurrent", "change", () => updateDebugIperfTargetOptions(el("debugIperfCurrent")?.value || ""));
 document.querySelectorAll("#debugModal .debug-tab").forEach((btn, index) => {
@@ -4637,6 +4786,8 @@ on("closeToastBtn", "click", () => closeToast(false));
 on("toastOkBtn", "click", () => closeToast(true));
 on("exportDetailLogBtn", "click", exportDetailLog);
 on("copyDetailJsonBtn", "click", copyDetailJson);
+on("formatDetailJsonBtn", "click", formatDetailJson);
+on("checkDetailJsonBtn", "click", checkDetailJsonDryRun);
 on("editDetailJsonBtn", "click", enableDetailJsonEdit);
 on("saveDetailJsonBtn", "click", saveDetailJson);
 on("confirmCloseBtn", "click", () => closeConfirmModal(false));
@@ -4664,6 +4815,15 @@ on("deletedPageSize", "change", () => { state.deletedPageSize = Number(el("delet
 on("closeTrafficModalBtn", "click", closeTrafficModal);
 on("closeTrafficModalBtn2", "click", closeTrafficModal);
 on("refreshTrafficBtn", "click", refreshTrafficRank);
+on("initTrafficCounterBtn", "click", initTrafficCounterForModal);
+on("trafficAutoRefresh", "change", () => {
+  if (trafficAutoTimer) { window.clearInterval(trafficAutoTimer); trafficAutoTimer = 0; }
+  if (el("trafficAutoRefresh")?.checked) {
+    trafficAutoTimer = window.setInterval(() => {
+      if (!el("trafficModal")?.classList.contains("hidden")) refreshTrafficRank().catch(() => {});
+    }, 3000);
+  }
+});
 el("toast")?.addEventListener("click", (event) => {
   if (event.target === el("toast")) closeToast();
 });
@@ -4684,7 +4844,17 @@ document.querySelectorAll(".segment").forEach((btn) => {
 
 on("closeSingboxLogModalBtn", "click", closeSingboxLogModal);
 on("closeSingboxLogModalBtn2", "click", closeSingboxLogModal);
-on("refreshSingboxLogBtn", "click", refreshSingboxLog);
+on("refreshSingboxLogBtn", "click", () => refreshSingboxLog(false));
+on("singboxLogLevel", "change", renderSingboxLogText);
+on("diagnoseSingboxLogBtn", "click", diagnoseSingboxLogWithAI);
+on("singboxLogAutoRefresh", "change", () => {
+  if (singboxLogAutoTimer) { window.clearInterval(singboxLogAutoTimer); singboxLogAutoTimer = 0; }
+  if (el("singboxLogAutoRefresh")?.checked) {
+    singboxLogAutoTimer = window.setInterval(() => {
+      if (!el("singboxLogModal")?.classList.contains("hidden")) refreshSingboxLog(true).catch(() => {});
+    }, 3000);
+  }
+});
 on("copySingboxLogBtn", "click", copySingboxLog);
 on("clearSingboxLogBtn", "click", clearSingboxLogView);
 on("singboxLogAlias", "change", refreshSingboxLog);
