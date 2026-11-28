@@ -53,20 +53,49 @@ ESTAB 0 0 10.0.0.2:20002 5.6.7.8:44444
 	}
 }
 
-func TestAddNodesRandomPortAndDeduplicateOutbounds(t *testing.T) {
+func TestAddNodesSequentialAndWrapAroundReclaimAndDeduplicate(t *testing.T) {
 	svc := NewServiceWithDataDir(t.TempDir())
 	_ = svc.SaveVPS(VPS{Alias: "us-1", Address: "1.2.3.4", Port: 22, Username: "root"})
 	res, err := svc.AddNodes(AddNodeRequest{
 		VPSAlias:         "us-1",
-		GroupName:        "rnd",
+		GroupName:        "seq",
 		InboundProtocol:  "vless",
 		OutboundProtocol: "socks",
-		RandomPort:       true,
 		Count:            3,
 		OutboundLines:    "9.9.9.1:1080:u:p\n9.9.9.1:1080:u:p\n9.9.9.2:1080:u:p\n9.9.9.3:1080:u:p",
 	})
 	if err != nil || !res.Success || res.Count != 3 {
-		t.Fatalf("AddNodes(RandomPort) failed: %+v, err=%v", res, err)
+		t.Fatalf("AddNodes sequential failed: %+v, err=%v", res, err)
+	}
+	cfgs, err := svc.loadNodeConfigMap("us-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	used := usedPortsFromConfigs(cfgs)
+	if len(used) != 3 || used[0] != 20000 || used[1] != 20001 || used[2] != 20002 {
+		t.Fatalf("expected sequential ports [20000 20001 20002], got %v", used)
+	}
+
+	// Simulate tail full at 65535 with gaps at 20000 & 20002 (20001 occupied): must wrap around from 20000
+	tailConfigs := map[string]map[string]any{
+		"a.json": {"inbounds": []any{map[string]any{"listen_port": 20001}}},
+		"b.json": {"inbounds": []any{map[string]any{"listen_port": 65535}}},
+	}
+	// Contiguous block from 20002..20003 when 20001 is taken
+	portsContig, err := allocateSequentialPorts(tailConfigs, 0, 2, 20000)
+	if err != nil || len(portsContig) != 2 || portsContig[0] != 20002 || portsContig[1] != 20003 {
+		t.Fatalf("expected contiguous wrap-around [20002 20003], got %v err=%v", portsContig, err)
+	}
+	// Fragmented fallback when only isolated gaps exist (20000 and 20002 free, 20001 and 20003..65535 taken)
+	fragConfigs := map[string]map[string]any{
+		"p20001.json": {"inbounds": []any{map[string]any{"listen_port": 20001}}},
+	}
+	for p := 20003; p <= 65535; p++ {
+		fragConfigs[fmt.Sprintf("p%d.json", p)] = map[string]any{"inbounds": []any{map[string]any{"listen_port": p}}}
+	}
+	portsFrag, err := allocateSequentialPorts(fragConfigs, 0, 2, 20000)
+	if err != nil || len(portsFrag) != 2 || portsFrag[0] != 20000 || portsFrag[1] != 20002 {
+		t.Fatalf("expected fragmented wrap-around reclaim [20000 20002], got %v err=%v", portsFrag, err)
 	}
 }
 

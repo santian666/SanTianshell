@@ -32,7 +32,6 @@ type AddNodeRequest struct {
 	InboundProtocol  string          `json:"inboundProtocol"`
 	OutboundProtocol string          `json:"outboundProtocol"`
 	StartPort        int             `json:"startPort"`
-	RandomPort       bool            `json:"randomPort,omitempty"`
 	Count            int             `json:"count"`
 	TLSEnabled       bool            `json:"tlsEnabled"`
 	RealityEnabled   bool            `json:"realityEnabled"`
@@ -53,7 +52,6 @@ type BatchAddNodeRequest struct {
 	InboundProtocol  string                `json:"inboundProtocol"`
 	OutboundProtocol string                `json:"outboundProtocol"`
 	StartPort        int                   `json:"startPort"`
-	RandomPort       bool                  `json:"randomPort,omitempty"`
 	TLSEnabled       bool                  `json:"tlsEnabled"`
 	RealityEnabled   bool                  `json:"realityEnabled"`
 	RealitySNI       string                `json:"realitySni"`
@@ -144,29 +142,76 @@ type OperationResult struct {
 	Items   []string `json:"items"`
 }
 
-func pickRandomFreePorts(configs map[string]map[string]any, count int) ([]int, error) {
+// allocateSequentialPorts 优先按当前最大端口顺延分配；仅当尾部顺序空间不足（超过 65535）时，
+// 才回绕从 defaultStart（默认 20000）起顺查空闲端口（优先连续段，碎片化时按升序复用空闲端口）。
+func allocateSequentialPorts(configs map[string]map[string]any, requestedStart int, count int, defaultStart int) ([]int, error) {
+	if count <= 0 {
+		return nil, errors.New("节点数量必须大于 0")
+	}
+	if defaultStart <= 0 {
+		defaultStart = 20000
+	}
+	if requestedStart > 0 {
+		if requestedStart > 65535 || requestedStart+count-1 > 65535 {
+			return nil, errors.New("端口范围超出限制")
+		}
+		if conflicts := usedPortsInRange(configs, requestedStart, count); len(conflicts) > 0 {
+			return nil, fmt.Errorf("端口已被占用: %v", conflicts)
+		}
+		ports := make([]int, count)
+		for i := 0; i < count; i++ {
+			ports[i] = requestedStart + i
+		}
+		return ports, nil
+	}
+
 	used := map[int]bool{}
+	maxPort := 0
 	for _, cfg := range configs {
 		if p := extractListenPort(cfg); p > 0 {
 			used[p] = true
+			if p > maxPort {
+				maxPort = p
+			}
 		}
 	}
-	const minPort, maxPort = 20000, 60000
-	if count <= 0 || count > (maxPort-minPort+1)-len(used) {
-		return nil, errors.New("可用随机端口不足")
+
+	// 1. 优先从最大已用端口之后顺延分配
+	if candidate := nextStartPort(maxPort, defaultStart); candidate > 0 && candidate+count-1 <= 65535 {
+		ports := make([]int, count)
+		for i := 0; i < count; i++ {
+			ports[i] = candidate + i
+		}
+		return ports, nil
 	}
+
+	// 2. 尾部已满，回绕到最初（defaultStart）优先找连续空闲段
+	for port := defaultStart; port <= 65535-count+1; port++ {
+		ok := true
+		for i := 0; i < count; i++ {
+			if used[port+i] {
+				ok = false
+				break
+			}
+		}
+		if ok {
+			ports := make([]int, count)
+			for i := 0; i < count; i++ {
+				ports[i] = port + i
+			}
+			return ports, nil
+		}
+	}
+
+	// 3. 若无连续空闲段，则从 defaultStart 起按升序回收零散空闲端口
 	ports := make([]int, 0, count)
-	var b [2]byte
-	for len(ports) < count {
-		if _, err := rand.Read(b[:]); err != nil {
-			return nil, err
+	for port := defaultStart; port <= 65535 && len(ports) < count; port++ {
+		if !used[port] {
+			ports = append(ports, port)
 		}
-		candidate := minPort + int(uint16(b[0])<<8|uint16(b[1]))%(maxPort-minPort+1)
-		if used[candidate] {
-			continue
-		}
-		used[candidate] = true
-		ports = append(ports, candidate)
+	}
+	if len(ports) < count {
+		return nil, errors.New("端口范围超出限制，无足够空闲端口")
 	}
 	return ports, nil
 }
@@ -215,26 +260,9 @@ func (s *Service) AddNodes(req AddNodeRequest) (OperationResult, error) {
 	if err != nil {
 		return OperationResult{}, err
 	}
-	var assignedPorts []int
-	if req.RandomPort {
-		assignedPorts, err = pickRandomFreePorts(configs, req.Count)
-		if err != nil {
-			return OperationResult{Success: false, Message: err.Error()}, nil
-		}
-	} else {
-		if req.StartPort <= 0 {
-			req.StartPort = firstFreePort(configs, req.Count, 20000)
-		}
-		if req.StartPort <= 0 || req.StartPort > 65535 || req.StartPort+req.Count-1 > 65535 {
-			return OperationResult{Success: false, Message: "端口范围超出限制"}, nil
-		}
-		if conflicts := usedPortsInRange(configs, req.StartPort, req.Count); len(conflicts) > 0 {
-			return OperationResult{Success: false, Message: fmt.Sprintf("端口已被占用: %v", conflicts)}, nil
-		}
-		assignedPorts = make([]int, req.Count)
-		for i := 0; i < req.Count; i++ {
-			assignedPorts[i] = req.StartPort + i
-		}
+	assignedPorts, err := allocateSequentialPorts(configs, req.StartPort, req.Count, 20000)
+	if err != nil {
+		return OperationResult{Success: false, Message: err.Error()}, nil
 	}
 	outbounds := deduplicateOutbounds(parseOutboundLines(req.OutboundLines, req.OutboundProtocol))
 	if len(outbounds) == 0 && req.OutboundDetails != nil {
@@ -305,28 +333,23 @@ func (s *Service) BatchAddNodes(req BatchAddNodeRequest) (OperationResult, error
 	if totalCount <= 0 {
 		return OperationResult{Success: false, Message: "没有需要添加的节点"}, nil
 	}
-	if req.StartPort <= 0 {
-		req.StartPort = firstFreePort(configs, totalCount, 20000)
-	}
-	if req.StartPort <= 0 || req.StartPort > 65535 || req.StartPort+totalCount-1 > 65535 {
-		return OperationResult{Success: false, Message: "端口范围超出限制"}, nil
-	}
-	if conflicts := usedPortsInRange(configs, req.StartPort, totalCount); len(conflicts) > 0 {
-		return OperationResult{Success: false, Message: fmt.Sprintf("端口已被占用: %v", conflicts)}, nil
+	assignedPorts, err := allocateSequentialPorts(configs, req.StartPort, totalCount, 20000)
+	if err != nil {
+		return OperationResult{Success: false, Message: err.Error()}, nil
 	}
 	created := []string{}
-	currentPort := req.StartPort
+	portIndex := 0
 	createdAt := time.Now().UTC().Format(time.RFC3339Nano)
 	pending := map[string]bool{}
 	for _, group := range req.Groups {
-		outbounds := parseOutboundLines(group.OutboundLines, req.OutboundProtocol)
+		outbounds := deduplicateOutbounds(parseOutboundLines(group.OutboundLines, req.OutboundProtocol))
 		if len(outbounds) == 0 {
 			outbounds = append(outbounds, defaultOutbound(req.OutboundProtocol))
 		}
 		for i := 0; i < group.Count; i++ {
 			outbound := cloneMap(outbounds[i%len(outbounds)])
 			groupName := resolvedNodeGroupName(group.GroupName, outbound, fallbackName)
-			config := generateConfig(groupName, req.InboundProtocol, currentPort, randomUUID(), req.OutboundProtocol, outbound, req.TLSEnabled, req.RealityEnabled, req.RealitySNI)
+			config := generateConfig(groupName, req.InboundProtocol, assignedPorts[portIndex], randomUUID(), req.OutboundProtocol, outbound, req.TLSEnabled, req.RealityEnabled, req.RealitySNI)
 			tag := extractNodeTag(config)
 			fileName := strings.ToLower(safeFileName(tag)) + ".json"
 			if _, exists := configs[fileName]; exists || pending[fileName] {
@@ -341,7 +364,7 @@ func (s *Service) BatchAddNodes(req BatchAddNodeRequest) (OperationResult, error
 			setNodeGroupMetadata(config, explicitGroup)
 			configs[fileName] = config
 			created = append(created, fileName)
-			currentPort++
+			portIndex++
 		}
 	}
 	if err := s.saveNodeConfigMap(req.VPSAlias, configs); err != nil {

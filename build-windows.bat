@@ -2,7 +2,7 @@
 chcp 65001 >nul
 setlocal
 
-set "VERSION=0.1.40"
+set "VERSION=0.1.41"
 set "RELEASE_DIR=release"
 set "X64_NAME=SanTianShell-%VERSION%-Windows-x64"
 set "IPERF3_SOURCE=build\windows\tools\iperf3\x64"
