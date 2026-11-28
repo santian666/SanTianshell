@@ -1740,13 +1740,27 @@ html.ui-scaled .security-settings,html.ui-scaled .about-grid article:last-child{
 :root[data-theme="dark"] .host-summary,
 :root[data-theme="dark"] .file-panel,
 :root[data-theme="dark"] .settings-grid article,
+:root[data-theme="dark"] .about-grid article,
 :root[data-theme="dark"] .host-page-tools,
 :root[data-theme="dark"] .host-page-body,
 :root[data-theme="dark"] .dialog,
 :root[data-theme="dark"] .drawer {
   background: var(--bg-surface);
   border-color: var(--border-subtle);
+  color: var(--text-primary);
   box-shadow: 0 2px 8px rgba(0, 0, 0, 0.22);
+}
+
+:root[data-theme="dark"] .about-grid h3,
+:root[data-theme="dark"] .about-grid dd,
+:root[data-theme="dark"] .about-grid b {
+  color: var(--text-primary);
+}
+
+:root[data-theme="dark"] .about-grid dt,
+:root[data-theme="dark"] .about-grid p,
+:root[data-theme="dark"] .about-page-head span {
+  color: var(--text-secondary);
 }
 
 :root[data-theme="dark"] .card-title,
@@ -2518,8 +2532,11 @@ html.ui-scaled .security-settings,html.ui-scaled .about-grid article:last-child{
   font: 11px/1.45 Consolas, "Microsoft YaHei Mono", monospace;
   color: #e2e8f0;
 }
+.update-settings {
+  grid-column: 1 / -1;
+}
 .update-settings p {
-  margin: 0;
+  margin: 0 0 12px;
   color: var(--text-secondary);
   font-size: 12px;
   line-height: 1.5;

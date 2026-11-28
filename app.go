@@ -36,7 +36,7 @@ import (
 	"golang.org/x/sys/windows/registry"
 )
 
-const appVersion = "0.1.37"
+const appVersion = "0.1.38"
 
 const (
 	maxAIModelsResponseSize  = 2 << 20
